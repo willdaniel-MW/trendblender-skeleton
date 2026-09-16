@@ -1,6 +1,6 @@
 ---
 name: trendblender-morning-brief
-description: Write the client-facing four-bullet morning brief for a TrendBlender brand. Load this skill when the user says "write the brief", "morning brief", "generate the brief", "client brief", "write the four bullets", or automatically at the end of a TrendBlender refresh run (called by trendblender-refresh). Produces `morning_brief.js` (window.MORNING_BRIEF) with exactly four bullets: strongest_signal, earned_media, creator_opportunity, time_sensitive — the fixed contract in schema/morning-brief.schema.json. Reads the brand's own brand-config.json for voice, pillar names, and locale; never hardcodes any single brand's content.
+description: "Write the client-facing four-bullet morning brief for a TrendBlender brand. Load this skill when the user says \"write the brief\", \"morning brief\", \"generate the brief\", \"client brief\", \"write the four bullets\", or automatically at the end of a TrendBlender refresh run (called by trendblender-refresh). Produces `morning_brief.js` (window.MORNING_BRIEF) with exactly four bullets: strongest_signal, earned_media, creator_opportunity, time_sensitive — the fixed contract in schema/morning-brief.schema.json. Reads the brand's own brand-config.json for voice, pillar names, and locale; never hardcodes any single brand's content."
 ---
 
 # TrendBlender — Morning Brief
