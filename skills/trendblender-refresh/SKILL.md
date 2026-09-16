@@ -9,7 +9,7 @@ description: Execute a TrendBlender refresh for a brand configured via brand-con
 
 Before starting, verify:
 
-1. `brand-config.json` exists at the repo root (or the path the operator gives you) and validates against `schema/brand-config.schema.json`. If it fails `scripts/validate_brand_config.py`, stop and tell the operator — do not guess at missing fields.
+1. `${CLAUDE_PLUGIN_ROOT}/brand-config.json` exists and validates against `${CLAUDE_PLUGIN_ROOT}/schema/brand-config.schema.json`. `${CLAUDE_PLUGIN_ROOT}` is the installed plugin's own directory (set automatically when this skill runs as part of an installed plugin) — always read and write this brand's files there, never relative to the operator's current working directory, or refresh output ends up disconnected from `dashboard/trendjack.html`. If it fails `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/validate_brand_config.py`, stop and tell the operator — do not guess at missing fields.
 2. Every pillar in `pillars[]` with `status: "active"` has a non-null `savedSearchId`. A pillar's boolean is drafted and persisted at **onboarding time** by a separate skill (`unified_retrieval_query_gen_tool` → `listening_create_search`, ID written back into `brand-config.json`) — this skill only *consumes* that ID, it never invents a boolean or creates a search itself. If an active pillar has `savedSearchId: null`, skip it, flag it in the operator report, and do not fabricate a substitute search.
 3. The relevant Meltwater MCP tools are loaded: `unified_retrieval_statistics_retrieval_tool`, `unified_retrieval_document_retrieval_tool`. Search for them with `ToolSearch` if they're deferred. If they're unavailable, tell the operator the connector needs authorizing and stop.
 4. Read `brand-config.json`'s `ops` block and hold yourself to it for the whole run: `ops.maxPillarsPerRefresh` (how many pillars this refresh may touch), `ops.maxDocumentsPerPillar` (hard cap on the `limit` param to the document tool), `ops.retentionWindowDays` (the lookback window for both fetch calls). These are cost controls, not suggestions — do not raise them because a pillar "looks thin."
@@ -44,7 +44,7 @@ This is the part the deterministic validators in Step 5 cannot do. Work through 
 
 ### Step 4 — write the trends file
 
-Write `trends_data.js` (this exact filename, always — the dashboard's `<script src="trends_data.js">` tag is fixed so a single-brand plugin build never needs per-brand HTML edits) in the **exact schema** below, registering into `window.TRENDS_DATA["<brandKey>"]` where brandKey = `brand.id` from brand-config.json — a lowercase-hyphen slug. Because `brand.id` contains hyphens, you MUST use bracket notation. Dot notation is invalid JS for a hyphenated key and will silently break the page load.
+Write `${CLAUDE_PLUGIN_ROOT}/dashboard/trends_data.js` (this exact filename, always — the dashboard's `<script src="trends_data.js">` tag is fixed so a single-brand plugin build never needs per-brand HTML edits) in the **exact schema** below, registering into `window.TRENDS_DATA["{brandKey}"]` where brandKey = `brand.id` from brand-config.json — a lowercase-hyphen slug. Because `brand.id` contains hyphens, you MUST use bracket notation. Dot notation is invalid JS for a hyphenated key and will silently break the page load. Writing anywhere other than `${CLAUDE_PLUGIN_ROOT}/dashboard/` — e.g. the operator's current working directory — produces a file `trendjack.html` will never load.
 
 ```js
 window.TRENDS_DATA = window.TRENDS_DATA || {};
@@ -93,17 +93,17 @@ See `references/schema.md` for the full field-by-field reference.
 ### Step 5 — run the deterministic validator
 
 ```bash
-python3 scripts/validate_trends.py trends_data.js brand-config.json
+python3 ${CLAUDE_PLUGIN_ROOT}/scripts/validate_trends.py ${CLAUDE_PLUGIN_ROOT}/dashboard/trends_data.js ${CLAUDE_PLUGIN_ROOT}/brand-config.json
 ```
 
 This checks score-key completeness (all five fixed keys, integers 1–10), momentum enum, platform enum, `activationMatch` against real activation names, id prefixing/uniqueness, and — critically — a forbidden-jargon scan that is **derived from this brand's own `pillars[].id`/`pillars[].name`**, not hardcoded to any specific brand's labels. Read `scripts/validate_trends.py` if you want the exact logic. Do not finalize output until it exits clean. If it fails, fix the file and re-run — do not hand-patch around a failure by relaxing the check.
 
 ### Step 6 — write the morning brief
 
-Load the `trendblender-morning-brief` skill to produce `morning_brief.js` — exactly four bullets (`strongest_signal`, `earned_media`, `creator_opportunity`, `time_sensitive`) drawn from the trends you just wrote. Then validate:
+Load the `trendblender-morning-brief` skill to produce `${CLAUDE_PLUGIN_ROOT}/dashboard/morning_brief.js` — exactly four bullets (`strongest_signal`, `earned_media`, `creator_opportunity`, `time_sensitive`) drawn from the trends you just wrote. Then validate:
 
 ```bash
-python3 scripts/validate_brief.py morning_brief.js
+python3 ${CLAUDE_PLUGIN_ROOT}/scripts/validate_brief.py ${CLAUDE_PLUGIN_ROOT}/dashboard/morning_brief.js
 ```
 
 Do not finalize until this also exits clean.

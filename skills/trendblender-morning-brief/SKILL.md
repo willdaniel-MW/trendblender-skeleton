@@ -15,7 +15,7 @@ description: "Write the client-facing four-bullet morning brief for a TrendBlend
 
 ## Read the brand's own config first
 
-Before drafting, read that brand's `brand-config.json` (validated against `schema/brand-config.schema.json`) for:
+Before drafting, read that brand's `${CLAUDE_PLUGIN_ROOT}/brand-config.json` (validated against `${CLAUDE_PLUGIN_ROOT}/schema/brand-config.schema.json`) for:
 
 - `brand.name`, `brand.essence`, `brand.archetype` — voice and positioning to write in.
 - `activations[].name` — the ONLY valid values a trend's `activationMatch` may reference; when a bullet recommends an activation, name one of these exactly, never invent one.
@@ -82,13 +82,13 @@ Write in the brand's own voice per `brand.archetype` and `brand.essence` from it
 
 ## Assembly workflow
 
-1. Read that brand's `brand-config.json` for voice, activations, and pillar labels to avoid leaking.
-2. Review the `trends_data.js` file just produced by the refresh.
+1. Read that brand's `${CLAUDE_PLUGIN_ROOT}/brand-config.json` for voice, activations, and pillar labels to avoid leaking.
+2. Review `${CLAUDE_PLUGIN_ROOT}/dashboard/trends_data.js`, just produced by the refresh.
 3. Identify the strongest narrative (usually the highest-view single post or the tightest multi-post consensus).
 4. Draft the four bullets in order.
 5. Verify: no forbidden phrases or leaked pillar ids/names (see `references/forbidden-phrases.md`), no raw search IDs, no pipeline jargon, correct locale convention, all four `kind` values present in the fixed order, the object literal is strict JSON.
-6. Write to `morning_brief.js` (`window.MORNING_BRIEF = {...};`).
-7. Run `python3 scripts/validate_brief.py path/to/morning_brief.js` and fix any reported errors before considering the brief done.
+6. Write to `${CLAUDE_PLUGIN_ROOT}/dashboard/morning_brief.js` (`window.MORNING_BRIEF = {...};`) — always this path, never the operator's current working directory, or `trendjack.html` won't find it.
+7. Run `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/validate_brief.py ${CLAUDE_PLUGIN_ROOT}/dashboard/morning_brief.js` and fix any reported errors before considering the brief done.
 8. Report to the operator with a one-line summary of the four titles.
 
 ## Reference material bundled

@@ -20,11 +20,11 @@ Say the user (with a brand already onboarded) types "do a run" or "refresh the t
 1. Load the `trendblender-refresh` skill.
 2. For each pillar in `brand-config.json`, fetch volume/sentiment via `unified_retrieval_statistics_retrieval_tool` and real evidence posts via `unified_retrieval_document_retrieval_tool`, scoped to that pillar's persisted Meltwater saved search.
 3. Cluster, dedupe, and score each candidate trend against the brand's territory, reject list, and activations.
-4. Write `trends_data.js` (per-brand trend data, registering `window.TRENDS_DATA["<brandKey>"]` — bracket notation, since brandKey is a hyphenated slug; the on-disk filename is always `trends_data.js`, never `trends_<brandKey>.js`, so the dashboard HTML never needs per-brand edits) and `morning_brief.js` (the four-bullet client-facing brief, `window.MORNING_BRIEF`).
+4. Write `${CLAUDE_PLUGIN_ROOT}/dashboard/trends_data.js` (per-brand trend data, registering `window.TRENDS_DATA["{brandKey}"]` — bracket notation, since brandKey is a hyphenated slug; the on-disk filename is always `trends_data.js`, never `trends_{brandKey}.js`, so the dashboard HTML never needs per-brand edits) and `${CLAUDE_PLUGIN_ROOT}/dashboard/morning_brief.js` (the four-bullet client-facing brief, `window.MORNING_BRIEF`). Both are always written inside the installed plugin's own `dashboard/` directory (`${CLAUDE_PLUGIN_ROOT}/dashboard/`) — never the operator's current working directory — because that's the only place `trendjack.html` will actually load them from.
 5. Validate both files with the deterministic Python scripts in `scripts/` before anything is considered final.
 6. Report back to the operator: which pillars were noisy or silent, any new noise patterns worth a boolean fix.
 
-The dashboard (`dashboard/trendjack.html`) reads brand identity, colours, and score weights from a `brand_config.js` sibling file at load time — it has no brand hardcoded into it.
+The dashboard (`${CLAUDE_PLUGIN_ROOT}/dashboard/trendjack.html`) reads brand identity, colours, and score weights from a `brand_config.js` sibling file at load time — it has no brand hardcoded into it. **To view it**, open `${CLAUDE_PLUGIN_ROOT}/dashboard/trendjack.html` directly in a browser (or tell the operator that exact path) — it's a static file in the plugin's install directory, not something the pipeline serves or launches on its own.
 
 ## What changed vs. a hand-rolled per-brand build
 

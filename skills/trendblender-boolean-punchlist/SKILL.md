@@ -90,13 +90,18 @@ When deprecating: delete the search entirely OR rename with a `zz_` prefix to re
 
 ## The fix isn't real until brand-config.json says so
 
-`brand-config.json` is the persisted artifact of record for pillar state, not the punchlist files (those are working notes for the operator/session). Whenever a punchlist action changes a pillar's durable state, write it back into that brand's `brand-config.json` immediately, not just into the punchlist/round-history notes:
+`brand-config.json` is the persisted artifact of record for pillar state, not the punchlist files (those are working notes for the operator/session). There are two copies of it, and a punchlist fix isn't done until **both** reflect the outcome:
+
+- **`${CLAUDE_PLUGIN_ROOT}/brand-config.json`** — the live copy inside the installed plugin, read by `trendblender-refresh` on the very next run. Update this so the fix takes effect immediately.
+- **The operator's separately persisted `brand-config.json`** (e.g. `./brand-configs/<brand-id>/brand-config.json`, saved during onboarding) — the source of truth `trendblender-onboard-brand`'s rebuild flow re-merges from. A fix left only in the installed copy is silently lost the next time this brand is rebuilt from its persisted config.
+
+Whenever a punchlist action changes a pillar's durable state, write it back into **both** immediately, not just into the punchlist/round-history notes:
 
 - **Deprecating a pillar** — set that pillar's `status` to `"deprecated"` in `pillars[]`. If it's being fully replaced rather than paused, consider whether a new pillar entry is warranted instead of resurrecting the old one.
 - **New or replaced saved search** — write the new search ID into that pillar's `savedSearchId` field. A pillar with a stale or null `savedSearchId` after a fix has landed is a config that's drifted from reality.
 - **Reactivating a punchlist item** — if a pillar's `status` was `"punchlist"` and the fix validated as WIN, set it back to `"active"`.
 
-Treat a punchlist round as incomplete — even after a WIN verdict — until `brand-config.json` reflects the outcome. A fix that only lives in `round-history.md` will be silently lost the next time the brand is rebuilt from its config.
+Treat a punchlist round as incomplete — even after a WIN verdict — until both `brand-config.json` copies reflect the outcome. A fix that only lives in `round-history.md`, or only in the installed plugin's copy, will be silently lost the next time the brand is rebuilt from its persisted config.
 
 ## Reference material bundled
 
