@@ -1,5 +1,10 @@
 # Changelog
 
+## v1.1.0 — 2026-09-16
+
+- Fixed unsubstituted `<brandKey>` template placeholders in `trendblender-refresh` and `trendblender-morning-brief` SKILL.md descriptions — these are syntactically XML tags and were failing plugin validation ("SKILL.md description cannot contain XML tags") on any generated brand build.
+- Added `scripts/sanitize_skills.py`, run by the onboarding skill before packaging, to catch this class of issue automatically on future builds.
+
 ## v1.0.0 — 2026-09-16
 
 Initial brand-agnostic skeleton, rebuilt from the Unilever Home Care TrendBlender plugin.
