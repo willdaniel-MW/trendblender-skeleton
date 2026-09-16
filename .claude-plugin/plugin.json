@@ -1,0 +1,8 @@
+{
+  "name": "trendblender-skeleton",
+  "version": "1.0.0",
+  "description": "Brand-agnostic social trend-jacking pipeline skeleton. Not installable as-is for a specific brand -- clone a tagged release and run it through the trendblender-onboard-brand skill to produce an installable, brand-specific plugin.",
+  "author": {
+    "name": "Meltwater"
+  }
+}

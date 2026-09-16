@@ -1,0 +1,77 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/willdaniel-MW/trendblender-skeleton/schema/trend-record.schema.json",
+  "title": "TrendBlender Trend Record",
+  "description": "The exact shape dashboard/trendjack.html expects inside window.TRENDS_DATA.<brandKey>.trends[]. Brand-agnostic UI rendering contract — the five score keys and four momentum values are fixed by the dashboard's own rendering code, not by any brand's config.",
+  "type": "object",
+  "required": ["generated_at", "trends"],
+  "additionalProperties": false,
+  "properties": {
+    "generated_at": { "type": "string", "description": "ISO-8601, prefer brand-local time with offset." },
+    "source_pillars": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string" },
+          "name": { "type": "string" },
+          "savedSearchId": { "type": ["integer", "null"] },
+          "status": { "type": "string", "enum": ["clean", "mixed", "noisy", "broken-mostly-noise", "silent-content-farm-only", "silent"] }
+        }
+      }
+    },
+    "data_quality_notes": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Internal, operator-facing only. Never surfaced to the brief."
+    },
+    "trends": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "name", "summary", "social", "news", "momentum", "scores", "source", "posts"],
+        "additionalProperties": false,
+        "properties": {
+          "id": { "type": "string", "description": "Stable per-brand identifier, format <brandKey>-<n>." },
+          "name": { "type": "string", "description": "Client-facing trend title. Must not contain pipeline jargon, raw search/pillar IDs, or hyphen-cased pillar labels." },
+          "summary": { "type": "string" },
+          "social": { "type": "string", "enum": ["HIGH", "MEDIUM", "LOW"] },
+          "news": { "type": "string", "enum": ["HIGH", "MEDIUM", "LOW"] },
+          "social_count": { "type": "integer", "minimum": 0 },
+          "news_count": { "type": "integer", "minimum": 0 },
+          "momentum": { "type": "string", "enum": ["emerging", "rising", "peaked", "declining"] },
+          "scores": {
+            "type": "object",
+            "required": ["topicFit", "audiencePerspective", "geoTiming", "competitiveWhitespace", "creativeStretch"],
+            "additionalProperties": false,
+            "properties": {
+              "topicFit": { "type": "integer", "minimum": 1, "maximum": 10 },
+              "audiencePerspective": { "type": "integer", "minimum": 1, "maximum": 10 },
+              "geoTiming": { "type": "integer", "minimum": 1, "maximum": 10 },
+              "competitiveWhitespace": { "type": "integer", "minimum": 1, "maximum": 10 },
+              "creativeStretch": { "type": "integer", "minimum": 1, "maximum": 10 }
+            }
+          },
+          "activationMatch": { "type": ["string", "null"], "description": "Must exactly match one of the brand config's activations[].name, or null." },
+          "source": { "type": "string", "enum": ["category", "adjacent"] },
+          "posts": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["text", "author", "platform"],
+              "additionalProperties": false,
+              "properties": {
+                "text": { "type": "string" },
+                "author": { "type": "string" },
+                "platform": { "type": "string", "enum": ["TikTok", "Instagram", "X", "Facebook", "YouTube", "Reddit", "News", "Social"] },
+                "url": { "type": "string", "format": "uri", "description": "Must be a real URL returned by unified_retrieval_document_retrieval_tool. Never fabricated — omit the field entirely if no URL was returned." },
+                "views": { "type": "integer", "minimum": 0 }
+              }
+            }
+          },
+          "hashtags": { "type": "array", "items": { "type": "string" } }
+        }
+      }
+    }
+  }
+}

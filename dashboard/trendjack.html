@@ -1,0 +1,1655 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>TrendBlender — Meltwater Trend Intelligence</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📈</text></svg>" />
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <!-- Pinned to a version that defaults to classic JSX runtime. Don't unpin — newer
+       @babel/standalone defaults to "automatic" runtime which emits `import` statements
+       at the top of transpiled output, which then fail to execute outside a module and
+       crash the React mount (blank white screen). -->
+  <script src="https://unpkg.com/@babel/standalone@7.21.0/babel.min.js"></script>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://unpkg.com/html-docx-js/dist/html-docx.js"></script>
+  <!-- ═══════════════════════════════════════════════════════════════════
+       Sibling-file contract for this dashboard (single brand per install):
+         - brand_config.js  -> sets window.BRAND_CONFIG   (schema/brand-config.schema.json)
+         - trends_data.js   -> sets window.TRENDS_DATA["<brandKey>"] (schema/trend-record.schema.json)
+         - morning_brief.js -> sets window.MORNING_BRIEF   (schema/morning-brief.schema.json)
+       All three are optional at load time — if a file is missing/fails to load,
+       the onerror handlers below log it and the dashboard falls back to a
+       "mock data" state (placeholder brand config / no trends / no morning brief
+       button) instead of crashing. The on-disk filename is always trends_data.js
+       (not trends_<brandKey>.js) so this HTML never needs editing per brand —
+       only the brandKey used as the object key inside that file changes. -->
+  <script src="brand_config.js" onerror="console.log('No brand_config.js — using placeholder demo brand config')"></script>
+  <script src="trends_data.js"  onerror="console.log('No live trends_data.js — using mock trend data')"></script>
+  <!-- Daily morning brief — written by the same refresh pipeline. Sets window.MORNING_BRIEF. -->
+  <script src="morning_brief.js" onerror="console.log('No morning_brief.js — button will be hidden')"></script>
+  <style>
+    body { margin: 0; overflow: hidden; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    input[type=range] { accent-color: #14b8a6; }
+    .line-clamp-1 { overflow: hidden; display: -webkit-box; -webkit-line-clamp: 1; -webkit-box-orient: vertical; }
+    .line-clamp-2 { overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+    .scroll-shadow { background: linear-gradient(white 30%, rgba(255,255,255,0)), linear-gradient(rgba(255,255,255,0), white 70%) 0 100%, radial-gradient(farthest-side at 50% 0, rgba(0,0,0,.08), rgba(0,0,0,0)), radial-gradient(farthest-side at 50% 100%, rgba(0,0,0,.08), rgba(0,0,0,0)) 0 100%; background-repeat: no-repeat; background-size: 100% 24px, 100% 24px, 100% 8px, 100% 8px; background-attachment: local, local, scroll, scroll; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!-- Force Babel to use the CLASSIC JSX runtime (React.createElement) instead of
+       the modern AUTOMATIC runtime which emits `import` statements that fail in a
+       non-module script and crash the React mount. This explicit registration
+       overrides whatever default the @babel/standalone CDN ships with. -->
+  <script>
+    if (typeof Babel !== "undefined") {
+      Babel.registerPreset("react-classic", {
+        presets: [[Babel.availablePresets["react"], { runtime: "classic" }]]
+      });
+    }
+  </script>
+  <script type="text/babel" data-presets="react-classic">
+    const { useState, useMemo } = React;
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // HELPERS
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    function genVelocity(pattern) {
+      return Array.from({ length: 14 }, (_, i) => {
+        let v;
+        if (pattern === "rising")    v = 15 + i * 7  + (i % 3) * 4;
+        else if (pattern === "peaked")    v = i < 7 ? 15 + i * 11 : 92 - (i - 7) * 9;
+        else if (pattern === "declining") v = 88 - i * 5 + (i % 2) * 5;
+        else                              v = 8 + (i % 4) * 3 + (i > 10 ? (i - 10) * 6 : 0);
+        return { d: i, v: Math.max(3, Math.round(v)) };
+      });
+    }
+
+    function opportunityWindow(social, news) {
+      if (social === "HIGH" && news === "LOW")  return "ACT_NOW";
+      if (social === "HIGH" && news !== "LOW")  return "TOO_LATE";
+      if (social !== "HIGH" && news === "HIGH") return "JOURNALIST";
+      return "WATCH";
+    }
+
+    const OW = {
+      ACT_NOW:    { label: "⚡ Act Now",            bg: "bg-green-50",  text: "text-green-800",  border: "border-green-300"  },
+      TOO_LATE:   { label: "⏱ Probably Too Late",   bg: "bg-red-50",    text: "text-red-800",    border: "border-red-300"    },
+      JOURNALIST: { label: "📰 Journalist Trend",   bg: "bg-slate-100", text: "text-slate-700",  border: "border-slate-300"  },
+      WATCH:      { label: "👁 Watch & Wait",        bg: "bg-amber-50",  text: "text-amber-800",  border: "border-amber-300"  },
+    };
+
+    function calcScore(scores, w) {
+      const { topicFit: tf, audiencePerspective: ap, geoTiming: gt, competitiveWhitespace: cw, creativeStretch: cs } = scores;
+      const total = w.tf + w.ap + w.gt + w.cw + w.cs;
+      // All five dimensions now follow the same direction: higher = better.
+      // For Stretch specifically, 10 means "no stretch / very natural fit", 1 means "huge creative stretch".
+      return parseFloat(((tf*w.tf + ap*w.ap + gt*w.gt + cw*w.cw + cs*w.cs) / total).toFixed(1));
+    }
+
+    // Converts the active brand config's scoring.weights (keyed by the full
+    // dimension names from the schema) into the short internal keys (tf/ap/gt/cw/cs)
+    // that calcScore/DIMS use throughout the dashboard. Falls back to equal
+    // weighting (1x each) if no config is loaded yet.
+    function weightsFromConfig() {
+      const cfg = getBrandConfig();
+      const w = cfg && cfg.scoring && cfg.scoring.weights;
+      if (!w) return { tf: 1, ap: 1, gt: 1, cw: 1, cs: 1 };
+      return { tf: w.topicFit, ap: w.audiencePerspective, gt: w.geoTiming, cw: w.competitiveWhitespace, cs: w.creativeStretch };
+    }
+
+    const DIMS = [
+      { key: "topicFit",              label: "Topic Fit",    wk: "tf", invert: false },
+      { key: "audiencePerspective",   label: "Audience",     wk: "ap", invert: false },
+      { key: "geoTiming",             label: "Geo Timing",   wk: "gt", invert: false },
+      { key: "competitiveWhitespace", label: "Comp. Space",  wk: "cw", invert: false },
+      { key: "creativeStretch",       label: "Stretch",      wk: "cs", invert: false },
+    ];
+
+    function Sparkline({ data }) {
+      const W = 72, H = 28;
+      const max = Math.max(...data.map(d => d.v));
+      const min = Math.min(...data.map(d => d.v));
+      const range = Math.max(1, max - min);
+      const points = data.map((d, i) => {
+        const x = (i / (data.length - 1)) * W;
+        const y = H - ((d.v - min) / range) * H + 2;
+        return `${x.toFixed(1)},${(y - 2).toFixed(1)}`;
+      }).join(" ");
+      return (
+        <svg width={W} height={H} style={{ display: "block" }}>
+          <polyline points={points} fill="none" stroke="#14b8a6" strokeWidth="1.5" strokeLinejoin="round" strokeLinecap="round" />
+        </svg>
+      );
+    }
+
+    function TinyBars({ data, color = "#14b8a6", height = 38, barW = 14, gap = 4, label }) {
+      const max = Math.max(1, ...data.map(d => d.v));
+      const totalW = data.length * (barW + gap);
+      return (
+        <div className="inline-flex flex-col items-start">
+          {label && <div className="text-[10px] text-gray-500 mb-1 uppercase tracking-wider">{label}</div>}
+          <svg width={totalW} height={height + 14}>
+            {data.map((d, i) => {
+              const h = (d.v / max) * height;
+              return (
+                <g key={i}>
+                  <rect x={i * (barW + gap)} y={height - h} width={barW} height={Math.max(1, h)} fill={color} rx="1" />
+                  <text x={i * (barW + gap) + barW / 2} y={height + 11} textAnchor="middle" fontSize="9" fill="#6b7280">{d.v}</text>
+                </g>
+              );
+            })}
+          </svg>
+        </div>
+      );
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // BRAND CONFIG — single-brand-per-install.
+    //
+    // window.BRAND_CONFIG (written by the trendblender-onboard-brand skill, see
+    // schema/brand-config.schema.json) is the ONLY source of brand identity,
+    // colours, audiences, activations, territory and scoring weights. There is
+    // no multi-brand switcher any more — one plugin build == one brand.
+    //
+    // If brand_config.js fails to load (see the <head> onerror handler above),
+    // we fall back to this small placeholder config so the dashboard still
+    // renders in a recognisable "mock data" state instead of crashing.
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    const FALLBACK_BRAND_CONFIG = {
+      schemaVersion: "1.0",
+      brand: {
+        id: "demo-brand",
+        name: "Demo Brand",
+        category: "Sample category",
+        essence: "Placeholder brand essence — this dashboard has no brand_config.js loaded yet.",
+        archetype: "The Placeholder",
+      },
+      identity: {
+        colors: { primary: "#14B8A6", secondary: "#0F172A", accent: "#F59E0B" },
+        hashtags: ["#DemoBrand"],
+        logoText: "TrendBlender",
+      },
+      audienceSegments: [
+        { id: "demo-1", name: "Demo Audience", description: "No brand_config.js found — showing placeholder audience data." },
+      ],
+      activations: [
+        { name: "Demo Activation", description: "Placeholder activation platform.", triggerKeywords: [] },
+      ],
+      territory: {
+        description: "No brand config loaded — this is placeholder territory copy.",
+        onTerritoryKeywords: [],
+      },
+      rejectList: [
+        { pattern: "Anything off-topic", reason: "Placeholder reject reason — replace with the real brand_config.js." },
+      ],
+      pillars: [],
+      scoring: {
+        dimensions: ["topicFit", "audiencePerspective", "geoTiming", "competitiveWhitespace", "creativeStretch"],
+        weights: { topicFit: 1, audiencePerspective: 1, geoTiming: 1, competitiveWhitespace: 1, creativeStretch: 1 },
+      },
+      ops: { refreshCadence: "n/a", retentionWindowDays: 3, maxPillarsPerRefresh: 1, maxDocumentsPerPillar: 10 },
+      meta: { builtFromSkeletonVersion: "n/a", createdAt: "2000-01-01" },
+    };
+
+    // Single accessor for the active brand config — the real config if
+    // brand_config.js loaded successfully, otherwise the fallback demo config above.
+    function getBrandConfig() {
+      return (typeof window !== "undefined" && window.BRAND_CONFIG) || FALLBACK_BRAND_CONFIG;
+    }
+    // ═══════════════════════════════════════════════════════════════════════════
+    // MOCK TRENDS — generic, brand-agnostic placeholder trends shown when
+    // trends_data.js hasn't been written yet by the refresh pipeline (see
+    // window.TRENDS_DATA[brandKey] / liveTrendsFor below).
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    const MOCK_TRENDS = [
+      { id: 1, name: "Placeholder trend — rising interest",
+        summary: "This is mock data shown because no live trends_data.js was found for this brand. Run the TrendBlender refresh pipeline to replace it with real Meltwater-sourced trends.",
+        social: "HIGH", news: "LOW", velocity: genVelocity("rising"), velocityScore: 7.5,
+        scores: { topicFit: 7, audiencePerspective: 7, geoTiming: 7, competitiveWhitespace: 7, creativeStretch: 5 },
+        activationMatch: null,
+        post: { text: "Example social post text would appear here once live data is connected.", author: "@example_user", platform: "TikTok" }
+      },
+      { id: 2, name: "Placeholder trend — steady conversation",
+        summary: "A second illustrative mock trend, useful for previewing dashboard layout before the first live refresh runs.",
+        social: "MEDIUM", news: "MEDIUM", velocity: genVelocity("emerging"), velocityScore: 5.8,
+        scores: { topicFit: 6, audiencePerspective: 6, geoTiming: 6, competitiveWhitespace: 6, creativeStretch: 5 },
+        activationMatch: null,
+        post: { text: "Another example post — swap in real Meltwater-sourced content via the refresh skill.", author: "@example_user_two", platform: "Instagram" }
+      },
+      { id: 3, name: "Placeholder trend — journalist coverage",
+        summary: "Illustrates the 'Journalist Trend' opportunity window (high news, lower social) using mock data.",
+        social: "LOW", news: "HIGH", velocity: genVelocity("peaked"), velocityScore: 4.9,
+        scores: { topicFit: 6, audiencePerspective: 5, geoTiming: 6, competitiveWhitespace: 7, creativeStretch: 4 },
+        activationMatch: null,
+        post: { text: "Placeholder news-style mention.", author: "News Outlet", platform: "News" }
+      },
+      { id: 4, name: "Placeholder trend — past its peak",
+        summary: "Illustrates the 'Probably Too Late' opportunity window using mock data.",
+        social: "HIGH", news: "HIGH", velocity: genVelocity("declining"), velocityScore: 3.1,
+        scores: { topicFit: 5, audiencePerspective: 5, geoTiming: 3, competitiveWhitespace: 4, creativeStretch: 6 },
+        activationMatch: null,
+        post: { text: "Placeholder declining-trend post.", author: "@example_user_three", platform: "X" }
+      },
+    ];
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // LIVE TRENDS LOADER — pulls real Meltwater-sourced data from window.TRENDS_DATA
+    // (populated by the trends_data.js script tag above, keyed by brandKey) and
+    // reshapes it into the internal trend object the UI expects. Falls back to
+    // MOCK_TRENDS if absent.
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    function liveTrendsFor(brandKey) {
+      const blob = (typeof window !== "undefined") && window.TRENDS_DATA && window.TRENDS_DATA[brandKey];
+      if (!blob || !Array.isArray(blob.trends)) return null;
+      const trends = blob.trends.map((t, i) => {
+        const postsList = Array.isArray(t.posts) && t.posts.length > 0
+          ? t.posts
+          : (t.post ? [t.post] : []);
+        return {
+          id: t.id || `${brandKey}-${i}`,
+          name: t.name,
+          summary: t.summary,
+          social: t.social,
+          news: t.news,
+          social_count: t.social_count,
+          news_count: t.news_count,
+          momentum: t.momentum || "emerging",
+          scores: t.scores,
+          activationMatch: t.activationMatch,
+          source: t.source || "category", // "category" or "adjacent"
+          posts: postsList,
+          post: postsList[0],
+          hashtags: t.hashtags || [],
+        };
+      });
+      return { trends, generated_at: blob.generated_at, source_searches: blob.source_searches, data_quality_notes: blob.data_quality_notes || [] };
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // ATOMS
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    function OWBadge({ status }) {
+      const c = OW[status];
+      return <span className={`inline-flex items-center px-2 py-0.5 rounded text-xs font-medium border whitespace-nowrap ${c.bg} ${c.text} ${c.border}`}>{c.label}</span>;
+    }
+
+    function ScoreChip({ score }) {
+      const bg = score >= 6.5 ? "bg-green-500" : score >= 5 ? "bg-amber-500" : "bg-red-400";
+      return <span className={`inline-flex items-center justify-center w-10 h-10 rounded-full text-white font-bold text-sm ${bg}`}>{score}</span>;
+    }
+
+    function MomentumPill({ momentum, count }) {
+      const style = {
+        rising:    { bg: "bg-green-50",  text: "text-green-800",  border: "border-green-300",  icon: "🚀", label: "Rising"    },
+        emerging:  { bg: "bg-teal-50",   text: "text-teal-800",   border: "border-teal-300",   icon: "⚡", label: "Emerging"  },
+        peaked:    { bg: "bg-amber-50",  text: "text-amber-800",  border: "border-amber-300",  icon: "🔥", label: "Peaked"    },
+        steady:    { bg: "bg-gray-50",   text: "text-gray-700",   border: "border-gray-300",   icon: "→",  label: "Steady"    },
+        declining: { bg: "bg-slate-100", text: "text-slate-600",  border: "border-slate-300",  icon: "📉", label: "Declining" },
+      };
+      const s = style[momentum] || style.steady;
+      return (
+        <span className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded text-xs font-medium border whitespace-nowrap ${s.bg} ${s.text} ${s.border}`}>
+          <span>{s.icon}</span>
+          <span>{s.label}</span>
+          {typeof count === "number" && <span className="text-gray-500 font-normal">· {count}</span>}
+        </span>
+      );
+    }
+
+    function ScoreBar({ value, invert = false }) {
+      const color = invert
+        ? (value <= 3 ? "bg-green-400" : value <= 6 ? "bg-amber-400" : "bg-red-400")
+        : (value >= 8 ? "bg-green-400" : value >= 5 ? "bg-amber-400" : "bg-red-400");
+      return (
+        <div className="flex items-center gap-2">
+          <div className="w-14 bg-gray-200 rounded-full h-1.5 flex-shrink-0">
+            <div className={`h-1.5 rounded-full ${color}`} style={{ width: `${(value / 10) * 100}%` }} />
+          </div>
+          <span className="text-xs font-semibold text-gray-700 w-4">{value}</span>
+        </div>
+      );
+    }
+
+    function Card({ title, subtitle, children, action, accent }) {
+      return (
+        <div className={`bg-white rounded-xl border ${accent ? "border-amber-200 bg-amber-50" : "border-gray-200"} p-5`}>
+          {(title || action) && (
+            <div className="flex items-start justify-between mb-3">
+              <div>
+                {title && <h3 className="font-semibold text-gray-900 text-sm">{title}</h3>}
+                {subtitle && <p className="text-xs text-gray-500 mt-0.5">{subtitle}</p>}
+              </div>
+              {action}
+            </div>
+          )}
+          {children}
+        </div>
+      );
+    }
+
+    function KeyRow({ label, value }) {
+      return (
+        <div className="grid grid-cols-12 gap-3 py-2 border-t border-gray-100 first:border-t-0">
+          <div className="col-span-4 text-xs font-medium text-gray-500 uppercase tracking-wide pt-0.5">{label}</div>
+          <div className="col-span-8 text-sm text-gray-800 leading-relaxed">{value}</div>
+        </div>
+      );
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // BRAND DNA
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    function BrandDNA({ brand }) {
+      const colors = (brand.identity && brand.identity.colors) || {};
+      const hashtags = (brand.identity && brand.identity.hashtags) || [];
+      return (
+        <div className="p-6 max-w-5xl space-y-5">
+          <div>
+            <h2 className="text-2xl font-bold text-gray-900">Brand DNA</h2>
+            <p className="text-sm text-gray-500 mt-1">The context used to score trend relevance and generate briefs</p>
+          </div>
+
+          {/* Identity */}
+          <Card>
+            <div className="flex flex-wrap items-baseline gap-2 mb-2">
+              <span className="text-2xl font-bold text-gray-900">{brand.name}</span>
+              <span className="text-xs bg-gray-100 text-gray-600 px-2 py-0.5 rounded">{brand.category}</span>
+              <span className="text-xs bg-blue-50 text-blue-700 px-2 py-0.5 rounded">{brand.archetype}</span>
+            </div>
+            <p className="text-sm text-gray-700 italic leading-relaxed">{brand.essence}</p>
+          </Card>
+
+          {/* Colours & hashtags */}
+          <Card title="Identity" subtitle="Colours, hashtags and wordmark used across generated briefs">
+            <div className="grid grid-cols-2 gap-4">
+              <div>
+                <div className="text-xs font-medium text-gray-500 uppercase tracking-wide mb-1.5">Colours</div>
+                <div className="flex flex-wrap gap-2">
+                  {["primary", "secondary", "accent"].filter(k => colors[k]).map(k => (
+                    <div key={k} className="flex items-center gap-1.5 text-xs bg-gray-50 border border-gray-200 rounded px-2 py-1">
+                      <span className="w-3.5 h-3.5 rounded-full border border-gray-300" style={{ backgroundColor: colors[k] }} />
+                      <span className="text-gray-600 capitalize">{k}</span>
+                      <span className="font-mono text-gray-800">{colors[k]}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+              <div>
+                <div className="text-xs font-medium text-gray-500 uppercase tracking-wide mb-1.5">Owned hashtags</div>
+                <div className="flex flex-wrap gap-1.5">
+                  {hashtags.length > 0
+                    ? hashtags.map(h => <span key={h} className="text-xs bg-blue-50 text-blue-700 border border-blue-200 px-2 py-0.5 rounded font-medium">{h}</span>)
+                    : <span className="text-xs text-gray-400 italic">None configured</span>}
+                </div>
+              </div>
+            </div>
+          </Card>
+
+          {/* Territory */}
+          <Card title="Territory" subtitle="What counts as on-territory for this brand">
+            <p className="text-sm text-gray-700 leading-relaxed mb-3">{brand.territory.description}</p>
+            {brand.territory.onTerritoryKeywords && brand.territory.onTerritoryKeywords.length > 0 && (
+              <div className="flex flex-wrap gap-1.5">
+                {brand.territory.onTerritoryKeywords.map(k => <span key={k} className="text-xs bg-teal-50 text-teal-700 border border-teal-200 px-2 py-0.5 rounded-full">{k}</span>)}
+              </div>
+            )}
+          </Card>
+
+          {/* Reject list */}
+          <Card title="Reject List" subtitle="Explicit off-territory patterns this brand rejects">
+            <ul className="space-y-2">
+              {brand.rejectList.map((r, i) => (
+                <li key={i} className="text-sm text-gray-700 flex gap-2">
+                  <span className="text-red-500 flex-shrink-0">−</span>
+                  <span><strong className="text-gray-900">{r.pattern}</strong> — {r.reason}</span>
+                </li>
+              ))}
+            </ul>
+          </Card>
+
+          {/* Audience segments */}
+          <Card title="Audience Segments" subtitle="Used for trend-audience matching and brief targeting">
+            <div className="grid grid-cols-3 gap-3">
+              {brand.audienceSegments.map(a => (
+                <div key={a.id} className="border border-gray-200 rounded-lg p-3">
+                  <div className="text-sm font-semibold text-gray-900 mb-1">{a.name}</div>
+                  <div className="text-xs text-gray-600 leading-relaxed">{a.description}</div>
+                </div>
+              ))}
+            </div>
+          </Card>
+
+          {/* Activation Moments */}
+          <div className="bg-amber-50 rounded-xl border border-amber-200 p-5">
+            <div className="mb-3">
+              <h3 className="font-semibold text-gray-900 text-sm">Activation Moments</h3>
+              <p className="text-xs text-amber-700 mt-0.5">⚡ Active campaign platforms — trend alignment to these boosts scoring</p>
+            </div>
+            <div className="grid grid-cols-2 gap-3">
+              {brand.activations.map((a, i) => (
+                <div key={i} className="bg-white rounded-lg border border-amber-200 p-3">
+                  <div className="font-semibold text-sm text-gray-900 mb-1">⚡ {a.name}</div>
+                  <p className="text-xs text-gray-600 mb-2 leading-relaxed">{a.description}</p>
+                  {a.triggerKeywords && a.triggerKeywords.length > 0 && (
+                    <div className="flex flex-wrap gap-1">
+                      {a.triggerKeywords.slice(0, 6).map(k => <span key={k} className="text-xs bg-amber-100 text-amber-800 px-1.5 py-0.5 rounded">{k}</span>)}
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          </div>
+
+          {/* Search pillars */}
+          {brand.pillars && brand.pillars.length > 0 && (
+            <Card title="Search Pillars" subtitle="What the refresh pipeline actually searches for">
+              <div className="space-y-2">
+                {brand.pillars.map(p => (
+                  <div key={p.id} className="flex items-start justify-between gap-3 border-t border-gray-100 first:border-t-0 pt-2 first:pt-0">
+                    <div>
+                      <div className="text-sm font-semibold text-gray-900">{p.name}</div>
+                      <div className="text-xs text-gray-600 leading-relaxed mt-0.5">{p.description}</div>
+                    </div>
+                    <span className={`text-xs px-1.5 py-0.5 rounded flex-shrink-0 ${p.status === "active" ? "bg-green-100 text-green-700" : p.status === "punchlist" ? "bg-amber-100 text-amber-700" : "bg-gray-100 text-gray-600"}`}>{p.status}</span>
+                  </div>
+                ))}
+              </div>
+            </Card>
+          )}
+
+          {/* Scoring weights */}
+          <Card title="Scoring Weights" subtitle="Per-brand weighting of the five fixed dashboard scoring dimensions">
+            <div className="grid grid-cols-5 gap-3">
+              {DIMS.map(d => (
+                <div key={d.key} className="text-center">
+                  <div className="text-xs text-gray-500">{d.label}</div>
+                  <div className="text-lg font-bold text-gray-900">{brand.scoring.weights[d.key] ?? 1}×</div>
+                </div>
+              ))}
+            </div>
+          </Card>
+
+          {/* Footer note */}
+          <div className="text-xs text-gray-400 leading-relaxed p-2">
+            Brand DNA is read entirely from this install's brand_config.js (window.BRAND_CONFIG) — one plugin build per brand, no brand switcher.
+          </div>
+        </div>
+      );
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // TREND ROW & TRENDS SECTION
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    function TrendRow({ trend, weights, onBrief }) {
+      const [open, setOpen] = useState(false);
+      const score = calcScore(trend.scores, weights);
+      const ow = opportunityWindow(trend.social, trend.news);
+      const isFiltered = score < 5.0;
+      const isRecommended = score >= 6.5 && ow === "ACT_NOW";
+
+      return (
+        <React.Fragment>
+          <tr onClick={() => setOpen(!open)} className={`border-b border-gray-100 cursor-pointer transition-colors hover:bg-gray-50 ${isFiltered ? "opacity-40" : ""}`}>
+            <td className="py-3 px-4">
+              <div className="flex items-start gap-2">
+                {trend.activationMatch && <span className="text-amber-500 text-sm mt-0.5 flex-shrink-0">⚡</span>}
+                <div className="min-w-0">
+                  <div className="flex items-center gap-1.5 flex-wrap">
+                    <span className={`text-sm font-medium ${isFiltered ? "line-through text-gray-400" : "text-gray-900"}`}>{trend.name}</span>
+                    {trend.source === "adjacent" && (
+                      <span className="text-[10px] uppercase tracking-wide font-semibold bg-purple-50 text-purple-700 border border-purple-200 px-1.5 py-0.5 rounded">Audience Adjacent</span>
+                    )}
+                  </div>
+                  {trend.analystNote && (
+                    <div className="text-xs text-teal-700 italic mt-0.5 max-w-xs truncate">{trend.analystNote}</div>
+                  )}
+                  <div className="text-xs text-gray-400 mt-0.5 max-w-xs truncate">{trend.summary}</div>
+                </div>
+              </div>
+            </td>
+            <td className="py-3 px-3"><OWBadge status={ow} /></td>
+            <td className="py-3 px-3"><MomentumPill momentum={trend.momentum || "emerging"} count={trend.social_count} /></td>
+            {DIMS.map(d => (
+              <td key={d.key} className="py-3 px-3 hidden xl:table-cell">
+                <ScoreBar value={trend.scores[d.key]} invert={d.invert} />
+              </td>
+            ))}
+            <td className="py-3 px-4 text-center"><ScoreChip score={score} /></td>
+            <td className="py-3 px-3">
+              <button
+                onClick={e => { e.stopPropagation(); onBrief(trend, score); }}
+                className={`text-xs px-3 py-1.5 rounded-lg font-medium whitespace-nowrap transition-colors ${
+                  isRecommended
+                    ? "bg-teal-500 hover:bg-teal-600 text-white"
+                    : "border border-gray-300 text-gray-700 hover:border-teal-400 hover:text-teal-700"
+                }`}
+                title={isRecommended ? "Recommended: high score + Act Now window" : "Create a brief on this trend"}
+              >
+                {isRecommended ? "Create Brief" : "+ Brief"}
+              </button>
+            </td>
+          </tr>
+          {open && (
+            <tr className="bg-gray-50 border-b border-gray-200">
+              <td colSpan={10} className="px-5 py-4">
+                {trend.analystNote && (
+                  <div className="bg-teal-50 border-l-4 border-teal-400 text-teal-900 text-sm italic px-4 py-2 mb-3 rounded-r">
+                    <span className="not-italic font-semibold text-teal-700 text-[10px] uppercase tracking-wider block mb-0.5">Analyst note</span>
+                    {trend.analystNote}
+                  </div>
+                )}
+                <p className="text-sm text-gray-700 mb-3">{trend.summary}</p>
+                <div className="flex flex-wrap gap-3 mb-4">
+                  {trend.activationMatch && (
+                    <span className="inline-flex items-center gap-1.5 bg-amber-50 border border-amber-200 text-amber-900 text-xs font-medium px-3 py-1.5 rounded-lg">
+                      ⚡ Activation match: {trend.activationMatch}
+                    </span>
+                  )}
+                  <span className={`inline-flex items-center text-xs px-3 py-1.5 rounded-lg border ${OW[ow].bg} ${OW[ow].text} ${OW[ow].border}`}>
+                    Social: <strong className="ml-1">{trend.social}</strong>&nbsp;·&nbsp;News: <strong>{trend.news}</strong>
+                  </span>
+                </div>
+                {trend.posts && trend.posts.length > 0 && (
+                  <div>
+                    <div className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-2">Example posts ({trend.posts.length})</div>
+                    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
+                      {trend.posts.map((p, idx) => (
+                        <div key={idx} className="bg-white border border-gray-200 rounded-lg p-3 flex flex-col">
+                          <div className="text-xs text-gray-400 mb-1.5 flex items-center justify-between gap-2">
+                            <span className="truncate">{p.platform} · {p.author}</span>
+                            {p.url && (
+                              <a href={p.url} target="_blank" rel="noopener noreferrer" onClick={e => e.stopPropagation()} className="text-teal-600 hover:text-teal-700 font-medium flex-shrink-0 whitespace-nowrap">View ↗</a>
+                            )}
+                          </div>
+                          <p className="text-sm text-gray-700 italic line-clamp-3">"{p.text}"</p>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </td>
+            </tr>
+          )}
+        </React.Fragment>
+      );
+    }
+
+    function Trends({ brand, trends, liveMeta, onBrief }) {
+      const [weights, setWeights]           = useState(weightsFromConfig);
+      const [pendingW, setPendingW]         = useState(weightsFromConfig);
+      const [showSettings, setShowSettings] = useState(false);
+      const [filter, setFilter]             = useState("all");
+      const [search, setSearch]             = useState("");
+      const isLive = !!liveMeta;
+      const refreshedLabel = isLive && liveMeta.generated_at
+        ? new Date(liveMeta.generated_at).toLocaleString("en-GB", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" })
+        : null;
+
+      const scored = useMemo(
+        () => trends.map(t => ({ ...t, _score: calcScore(t.scores, weights) })).sort((a, b) => b._score - a._score),
+        [weights, trends]
+      );
+
+      const visible = scored.filter(t => {
+        const ow = opportunityWindow(t.social, t.news);
+        if (filter === "act_now" && ow !== "ACT_NOW") return false;
+        if (filter === "watch"   && !["WATCH", "JOURNALIST"].includes(ow)) return false;
+        if (search && !t.name.toLowerCase().includes(search.toLowerCase())) return false;
+        return true;
+      });
+
+      const counts = {
+        actNow:   scored.filter(t => t._score >= 6.5 && opportunityWindow(t.social, t.news) === "ACT_NOW").length,
+        watching: scored.filter(t => t._score >= 5 && t._score < 6.5).length,
+        filtered: scored.filter(t => t._score < 5).length,
+      };
+
+      return (
+        <div className="p-6 space-y-5">
+          <div className="flex items-center justify-between">
+            <div>
+              <h2 className="text-2xl font-bold text-gray-900">Trends</h2>
+              <p className="text-sm text-gray-500 mt-1">
+                Scored against {brand.name}'s Brand DNA · {isLive ? <span className="text-teal-600 font-medium">Live Meltwater data</span> : <span className="text-amber-600 font-medium">Mock data (no live refresh yet)</span>}
+              </p>
+            </div>
+            <button onClick={() => setShowSettings(!showSettings)} className={`text-sm px-3 py-2 rounded-lg border flex items-center gap-1.5 transition-colors ${showSettings ? "bg-gray-900 text-white border-gray-900" : "border-gray-300 text-gray-700 hover:border-gray-400"}`}>
+              ⚙ Score Settings
+            </button>
+          </div>
+
+          {isLive && (
+            <div className="bg-teal-50 border border-teal-200 rounded-lg px-4 py-2.5 flex items-center justify-between flex-wrap gap-2">
+              <div className="flex items-baseline gap-3 text-sm">
+                <span className="text-teal-800 font-semibold">⚡ Live data</span>
+                <span className="text-gray-700">Last refreshed: <strong>{refreshedLabel || "unknown"}</strong></span>
+              </div>
+            </div>
+          )}
+
+          <div className="flex gap-3">
+            {[
+              { n: counts.actNow,   label: "Act Now",  bg: "bg-green-50 border-green-200", tx: "text-green-700" },
+              { n: counts.watching, label: "Watching", bg: "bg-amber-50 border-amber-200", tx: "text-amber-700" },
+              { n: counts.filtered, label: "Filtered", bg: "bg-gray-50 border-gray-200",   tx: "text-gray-500"  },
+              { n: scored.length,   label: "Detected", bg: "bg-blue-50 border-blue-200",   tx: "text-blue-700"  },
+            ].map(({ n, label, bg, tx }) => (
+              <div key={label} className={`rounded-lg border px-4 py-2 text-center ${bg}`}>
+                <div className={`text-2xl font-bold ${tx}`}>{n}</div>
+                <div className={`text-xs ${tx}`}>{label}</div>
+              </div>
+            ))}
+          </div>
+
+          {showSettings && (
+            <div className="bg-gray-50 border border-gray-200 rounded-xl p-5">
+              <h4 className="text-sm font-semibold text-gray-900 mb-4">Scoring Weights</h4>
+              <div className="grid grid-cols-5 gap-5">
+                {DIMS.map(d => (
+                  <div key={d.wk}>
+                    <label className="text-xs text-gray-500 block mb-2">{d.label}</label>
+                    <input type="range" min={0} max={3} step={0.5} value={pendingW[d.wk]} onChange={e => setPendingW({ ...pendingW, [d.wk]: parseFloat(e.target.value) })} className="w-full accent-teal-500" />
+                    <div className="text-xs text-center text-gray-600 mt-1">{pendingW[d.wk]}×</div>
+                  </div>
+                ))}
+              </div>
+              <div className="flex gap-2 mt-4">
+                <button onClick={() => setWeights(pendingW)} className="text-sm bg-teal-500 hover:bg-teal-600 text-white px-4 py-1.5 rounded-lg font-medium transition-colors">Recalculate</button>
+                <button onClick={() => { const d = weightsFromConfig(); setWeights(d); setPendingW(d); }} className="text-sm text-gray-500 hover:text-gray-700 px-3 py-1.5">Reset defaults</button>
+              </div>
+            </div>
+          )}
+
+          <div className="flex gap-3 items-center">
+            <div className="flex rounded-lg border border-gray-200 overflow-hidden text-sm">
+              {[["all", "All"], ["act_now", "⚡ Act Now"], ["watch", "👁 Watching"]].map(([v, l]) => (
+                <button key={v} onClick={() => setFilter(v)} className={`px-4 py-2 transition-colors ${filter === v ? "bg-gray-900 text-white" : "bg-white text-gray-600 hover:bg-gray-50"}`}>{l}</button>
+              ))}
+            </div>
+            <input placeholder="Search trends…" value={search} onChange={e => setSearch(e.target.value)} className="border border-gray-200 rounded-lg px-3 py-2 text-sm flex-1 max-w-xs focus:outline-none focus:border-teal-400" />
+          </div>
+
+          {isLive && trends.length === 0 ? (
+            <div className="bg-amber-50 border border-amber-200 rounded-xl p-8 text-center">
+              <div className="text-3xl mb-2">🔍</div>
+              <h3 className="text-base font-semibold text-amber-900">No emerging trends in the last 3 days</h3>
+            </div>
+          ) : (
+            <div className="bg-white border border-gray-200 rounded-xl overflow-hidden">
+              <table className="w-full">
+                <thead className="bg-gray-50 border-b border-gray-200">
+                  <tr>
+                    <th className="text-left text-xs font-medium text-gray-500 py-3 px-4 w-72">Trend</th>
+                    <th className="text-left text-xs font-medium text-gray-500 py-3 px-3">Window</th>
+                    <th className="text-left text-xs font-medium text-gray-500 py-3 px-3">Momentum</th>
+                    {DIMS.map(d => <th key={d.key} className="text-left text-xs font-medium text-gray-500 py-3 px-3 hidden xl:table-cell">{d.label}</th>)}
+                    <th className="text-center text-xs font-medium text-gray-500 py-3 px-4">Score</th>
+                    <th className="py-3 px-3 w-28"></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {visible.map(t => <TrendRow key={t.id} trend={t} weights={weights} onBrief={onBrief} />)}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // BRIEF — generic influencer brief template structure, populated from BRAND_CONFIG
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    function buildBrief(trend, score, brand, liveMeta) {
+      const ow = opportunityWindow(trend.social, trend.news);
+      const today = new Date();
+      const liveDate = new Date(today.getTime() + 14 * 24 * 60 * 60 * 1000);
+      const endDate = new Date(today.getTime() + 42 * 24 * 60 * 60 * 1000);
+      const fmt = d => d.toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric" });
+      const activation = trend.activationMatch ? (brand.activations || []).find(a => a.name === trend.activationMatch) : null;
+      const audienceSegments = brand.audienceSegments || [];
+      const primaryAud = audienceSegments.slice(0, 2);
+      const matchingSegment = audienceSegments.find(a => trend.name.toLowerCase().includes((a.name || "").toLowerCase().split(" ")[0])) || audienceSegments[0];
+      const matchingCommunity = matchingSegment ? matchingSegment.name : "core audience";
+      const hashtags = (brand.identity && brand.identity.hashtags) || [];
+      const logoText = (brand.identity && brand.identity.logoText) || brand.name;
+      const colors = (brand.identity && brand.identity.colors) || {};
+
+      // Snapshot the metric evidence into the brief at creation time so it doesn't drift.
+      const socialTotal = typeof trend.social_count === "number" ? trend.social_count : (trend.velocity || []).reduce((s, p) => s + p.v, 0);
+      const newsTotal   = typeof trend.news_count   === "number" ? trend.news_count   : (trend.velocity_news || []).reduce((s, p) => s + p.v, 0);
+      const confidence = socialTotal >= 30 ? "Medium"
+                       : socialTotal >= 10 ? "Low–Medium"
+                       : "Low (very small sample)";
+
+      return {
+        id: Date.now(),
+        trendName: trend.name,
+        trendScore: score,
+        opportunityWindow: ow,
+        brandKey: brand.id,
+        created: fmt(today),
+
+        // Header (Influencer Brief Template top section)
+        header: {
+          projectName: `${brand.name} × ${trend.name}`,
+          market: "—",
+          brandLead: "[Brand Manager]",
+          brandCategory: `${brand.name} / ${brand.category}`,
+          briefingDate: fmt(today),
+          liveDate: fmt(liveDate),
+          endDate: fmt(endDate),
+          product: brand.category,
+        },
+
+        // Summary line
+        oneLine: `Position ${brand.name} inside the "${trend.name}" conversation using ${activation ? `the ${activation.name} platform` : "an opportunistic creative angle"} — while the window is still open.`,
+
+        // Cultural Moment (the trend)
+        culturalMoment: {
+          description: trend.summary,
+          examplePost: trend.post,
+          examplePosts: trend.posts || (trend.post ? [trend.post] : []),
+          status: ow,
+        },
+
+        // Trend Evidence — snapshotted metric data validating that this trend is real
+        metrics: {
+          windowLabel: "Last 3 days (72 hours)",
+          socialTotal,
+          newsTotal,
+          socialClass: trend.social,
+          newsClass: trend.news,
+          momentum: trend.momentum || "emerging",
+          confidence,
+          hashtags: trend.hashtags || [],
+          capturedAt: (liveMeta && liveMeta.generated_at) || null,
+          isLiveData: !!liveMeta,
+        },
+
+        // Campaign Objective / KPIs
+        objective: ow === "ACT_NOW"
+          ? `Drive cultural relevance and earned share of voice inside the "${trend.name}" conversation. Secondary: drive ${brand.category} consideration among ${primaryAud.map(a => a.name).join(" and ") || "the brand's core audience"}. KPIs: organic reach, engagement rate (>3% benchmark), branded mentions, sentiment shift.`
+          : `Tactical participation only — match the conversation's energy without overspending. KPIs: engagement quality, sentiment.`,
+
+        // Campaign Overview
+        overview: `${brand.name}'s ${activation ? `"${activation.name}" platform` : "active social strategy"} provides the natural entry point into the "${trend.name}" conversation. ${activation ? activation.description : ""} Activate primarily on TikTok and Instagram with influencer-led content, supported by organic brand posts and paid amplification of the strongest performers.`,
+
+        // Why relevant
+        whyRelevant: [
+          `Topic Fit (${trend.scores.topicFit}/10): ${trend.activationMatch ? `Directly aligns with the "${trend.activationMatch}" activation. ` : ""}This trend overlaps with ${brand.name}'s core territory: ${(brand.territory.description || "").split(".")[0].toLowerCase()}.`,
+          `Audience (${trend.scores.audiencePerspective}/10): The community driving this trend overlaps strongly with the "${matchingCommunity}" segment.`,
+          `Geographic Timing (${trend.scores.geoTiming}/10): ${trend.scores.geoTiming >= 7 ? "Strong signal with early momentum — window is open." : "Moderate signal — monitor for strength in target markets."}`,
+          `Competitive Whitespace (${trend.scores.competitiveWhitespace}/10): ${trend.scores.competitiveWhitespace >= 7 ? "No competitor is currently owning this conversation. Clear space to act." : "Some competitor activity exists — find a differentiated angle."}`,
+          `Creative Stretch (${trend.scores.creativeStretch}/10): ${trend.scores.creativeStretch >= 8 ? "Very natural connection — audiences will accept brand participation immediately." : trend.scores.creativeStretch >= 5 ? "Moderate stretch — the angle needs clear grounding in what the brand stands for." : "Significant creative stretch — only worth it if the audience signal is huge."}`,
+        ],
+
+        // Messaging & Content
+        messaging: {
+          keyMessages: [
+            brand.essence,
+            brand.territory.description,
+            activation ? `${activation.name}: ${(activation.description || "").split(".")[0]}.` : `${brand.archetype}`,
+          ],
+          cta: `Drive followers to discover ${brand.name} — include link in bio. Use creator's own voice for product mention.${logoText ? ` Tag ${logoText}.` : ""}`,
+          hashtags: [
+            ...hashtags.slice(0, 4),
+            activation ? `#${activation.name.replace(/[^a-zA-Z0-9]/g, "")}` : null,
+            ...((trend.post && trend.post.text.match(/#\w+/g)) || []).slice(0, 2),
+          ].filter(Boolean),
+        },
+
+        // Targeting
+        targeting: {
+          organic: `${primaryAud.map(a => a.name).join(" and ") || "Core audience"}. Community focus: ${matchingCommunity}.`,
+          paid: `${primaryAud.map(a => a.name).join(" and ") || "Core audience"}. Layered with social interest signals: ${trend.name.split(" ").slice(0, 3).join(", ").toLowerCase()}.`,
+        },
+
+        // Influencer Criteria
+        influencerCriteria: {
+          description: brand.territory.description,
+          criteria: audienceSegments.map(a => `${a.name}: ${a.description}`),
+          tier: ow === "ACT_NOW" ? "Micro and mid-tier preferred for authenticity and speed-to-market" : "Mid-tier with engaged audiences",
+        },
+
+        // About brand / about product
+        aboutBrand: `${brand.essence}${brand.archetype ? ` (${brand.archetype})` : ""}`,
+        aboutProduct: `${brand.category} — ${brand.essence}`,
+
+        // Do's & Don'ts (from territory/reject-list — new brand-config schema has no
+        // free-standing guardrails.dos/donts list, so we derive equivalents)
+        dos: [brand.territory.description, ...(brand.territory.onTerritoryKeywords || []).map(k => `Stay on-territory: ${k}`)],
+        donts: (brand.rejectList || []).map(r => `${r.pattern} — ${r.reason}`),
+
+        // Brand Tool Kit
+        toolkit: {
+          tagline: logoText,
+          dbas: hashtags,
+          colors: Object.values(colors),
+          mascot: null,
+          handles: {},
+          ownedHashtags: hashtags,
+        },
+
+        // Posting Timeline
+        timeline: [
+          { stage: "Contractual / briefing kick-off",  date: fmt(today) },
+          { stage: "Production",                       date: fmt(new Date(today.getTime() + 5 * 86400000)) },
+          { stage: "First brand review",               date: fmt(new Date(today.getTime() + 8 * 86400000)) },
+          { stage: "Edit & second review",             date: fmt(new Date(today.getTime() + 11 * 86400000)) },
+          { stage: "Final approval",                   date: fmt(new Date(today.getTime() + 13 * 86400000)) },
+          { stage: "Content go-live",                  date: fmt(liveDate) },
+        ],
+
+        // Response format
+        responseFormat: ow === "ACT_NOW"
+          ? "Primary: 1× hero TikTok or Reel (15–30s), 2× supporting in-feed posts, 3× Stories. Optional repurposing for paid usage."
+          : "1× in-feed post + 1× Stories sequence.",
+
+        // Channels
+        channels: ow === "ACT_NOW" ? ["TikTok (lead)", "Instagram Reels", "Instagram Stories", "Paid amplification of best performer"] : ["Instagram", "Stories"],
+
+        // Activation match
+        activationLink: trend.activationMatch,
+      };
+    }
+
+    function BriefSection({ label, sub, children, color = "gray" }) {
+      const colorMap = {
+        gray:   "border-gray-200",
+        teal:   "border-teal-300 bg-teal-50",
+        amber:  "border-amber-300 bg-amber-50",
+        green:  "border-green-300 bg-green-50",
+        red:    "border-red-300 bg-red-50",
+        blue:   "border-blue-300 bg-blue-50",
+      };
+      return (
+        <section className={`border rounded-lg p-4 ${colorMap[color]}`}>
+          <div className="flex items-baseline justify-between mb-2">
+            <div className="text-xs font-bold text-gray-700 uppercase tracking-wider">{label}</div>
+            {sub && <div className="text-xs text-gray-500">{sub}</div>}
+          </div>
+          {children}
+        </section>
+      );
+    }
+
+    function BriefBody({ brief, brand }) {
+      return (
+        <div className="space-y-4">
+          {/* Header — matches Influencer Brief Template top block */}
+          <div className="grid grid-cols-2 gap-3 bg-gray-900 text-white rounded-lg p-4">
+            <div>
+              <div className="text-xs text-gray-400 uppercase tracking-wider">Project / Campaign</div>
+              <div className="text-sm font-semibold mt-0.5">{brief.header.projectName}</div>
+            </div>
+            <div>
+              <div className="text-xs text-gray-400 uppercase tracking-wider">Brand / Category</div>
+              <div className="text-sm mt-0.5">{brief.header.brandCategory}</div>
+            </div>
+            <div>
+              <div className="text-xs text-gray-400 uppercase tracking-wider">Market</div>
+              <div className="text-sm mt-0.5">{brief.header.market}</div>
+            </div>
+            <div>
+              <div className="text-xs text-gray-400 uppercase tracking-wider">Brand Lead</div>
+              <div className="text-sm mt-0.5">{brief.header.brandLead}</div>
+            </div>
+            <div>
+              <div className="text-xs text-gray-400 uppercase tracking-wider">Product</div>
+              <div className="text-sm mt-0.5">{brief.header.product}</div>
+            </div>
+            <div>
+              <div className="text-xs text-gray-400 uppercase tracking-wider">Briefing Date</div>
+              <div className="text-sm mt-0.5">{brief.header.briefingDate}</div>
+            </div>
+            <div>
+              <div className="text-xs text-gray-400 uppercase tracking-wider">Live Date</div>
+              <div className="text-sm mt-0.5">{brief.header.liveDate}</div>
+            </div>
+            <div>
+              <div className="text-xs text-gray-400 uppercase tracking-wider">End Date</div>
+              <div className="text-sm mt-0.5">{brief.header.endDate}</div>
+            </div>
+          </div>
+
+          {/* One line summary */}
+          <div className="bg-teal-500 text-white rounded-lg p-4">
+            <div className="text-xs font-bold uppercase tracking-wider opacity-80 mb-1">One-line summary</div>
+            <p className="text-sm leading-relaxed">{brief.oneLine}</p>
+          </div>
+
+          {/* Status strip */}
+          <div className={`flex items-center justify-between p-4 rounded-lg border gap-3 flex-wrap ${OW[brief.opportunityWindow].bg} ${OW[brief.opportunityWindow].border}`}>
+            <OWBadge status={brief.opportunityWindow} />
+            {brief.activationLink && (
+              <span className="inline-flex items-center gap-1.5 bg-amber-100 border border-amber-300 text-amber-900 text-xs font-semibold px-3 py-1.5 rounded-lg">
+                ⚡ {brief.activationLink}
+              </span>
+            )}
+            <ScoreChip score={brief.trendScore} />
+          </div>
+
+          {/* Cultural Moment */}
+          <BriefSection label="Cultural Moment" sub="The trend driving this brief" color="amber">
+            <p className="text-sm text-gray-800 leading-relaxed mb-3">{brief.culturalMoment.description}</p>
+            {brief.culturalMoment.examplePosts && brief.culturalMoment.examplePosts.length > 0 && (
+              <div>
+                <div className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-2">Example posts ({brief.culturalMoment.examplePosts.length})</div>
+                <div className="space-y-2">
+                  {brief.culturalMoment.examplePosts.map((p, idx) => (
+                    <div key={idx} className="bg-white border border-gray-200 rounded-lg p-3">
+                      <div className="text-xs text-gray-400 mb-1.5 flex items-center justify-between gap-2">
+                        <span className="truncate">{p.platform} · {p.author}</span>
+                        {p.url && (
+                          <a href={p.url} target="_blank" rel="noopener noreferrer" className="text-teal-600 hover:text-teal-700 font-medium flex-shrink-0 whitespace-nowrap">View ↗</a>
+                        )}
+                      </div>
+                      <p className="text-sm text-gray-700 italic">"{p.text}"</p>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </BriefSection>
+
+          {/* Trend Evidence — snapshot of metric data validating the trend */}
+          <BriefSection
+            label="Trend Evidence"
+            sub={brief.metrics.isLiveData ? `Snapshot from Meltwater · ${brief.metrics.windowLabel}` : `Mock data · ${brief.metrics.windowLabel}`}
+          >
+            <div className="grid grid-cols-4 gap-3 mb-4">
+              <div className="bg-white border border-gray-200 rounded-lg p-3">
+                <div className="text-xs font-medium text-gray-500 uppercase tracking-wide mb-1">Social mentions</div>
+                <div className="text-2xl font-bold text-gray-900 leading-none">{brief.metrics.socialTotal.toLocaleString()}</div>
+                <div className="text-xs text-gray-500 mt-1">over last 72h</div>
+              </div>
+              <div className="bg-white border border-gray-200 rounded-lg p-3">
+                <div className="text-xs font-medium text-gray-500 uppercase tracking-wide mb-1">News mentions</div>
+                <div className="text-2xl font-bold text-gray-900 leading-none">{brief.metrics.newsTotal.toLocaleString()}</div>
+                <div className="text-xs text-gray-500 mt-1">over last 72h</div>
+              </div>
+              <div className="bg-white border border-gray-200 rounded-lg p-3">
+                <div className="text-xs font-medium text-gray-500 uppercase tracking-wide mb-1">Momentum</div>
+                <div className="mt-1"><MomentumPill momentum={brief.metrics.momentum} /></div>
+              </div>
+              <div className="bg-white border border-gray-200 rounded-lg p-3">
+                <div className="text-xs font-medium text-gray-500 uppercase tracking-wide mb-1">Confidence</div>
+                <div className="text-base font-bold text-gray-900">{brief.metrics.confidence}</div>
+              </div>
+            </div>
+
+            {brief.metrics.hashtags.length > 0 && (
+              <div className="mb-3">
+                <div className="text-xs font-medium text-gray-500 uppercase tracking-wide mb-1.5">Top hashtags driving the conversation</div>
+                <div className="flex flex-wrap gap-1.5">
+                  {brief.metrics.hashtags.map(h => <span key={h} className="text-xs bg-blue-50 text-blue-700 border border-blue-200 px-2 py-0.5 rounded font-medium">{h}</span>)}
+                </div>
+              </div>
+            )}
+
+            <div className="text-xs text-gray-500 border-t border-gray-200 pt-2.5 mt-2">
+              <strong>Data source:</strong>{" "}
+              {brief.metrics.isLiveData
+                ? "Meltwater social listening"
+                : "Mock/illustrative — replace with live Meltwater data"}
+              {brief.metrics.capturedAt && <span>{" · Captured "}{new Date(brief.metrics.capturedAt).toLocaleString("en-GB", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" })}</span>}
+            </div>
+          </BriefSection>
+
+          {/* Why relevant */}
+          <BriefSection label={`Why It's Relevant for ${brand.name}`}>
+            <div className="space-y-2">
+              {brief.whyRelevant.map((r, i) => (
+                <div key={i} className="flex gap-2 text-sm">
+                  <span className="text-teal-500 flex-shrink-0 mt-0.5">✓</span>
+                  <span className="text-gray-700 leading-relaxed">{r}</span>
+                </div>
+              ))}
+            </div>
+          </BriefSection>
+
+          {/* Campaign Objective */}
+          <BriefSection label="Campaign Objective / KPIs">
+            <p className="text-sm text-gray-800 leading-relaxed">{brief.objective}</p>
+          </BriefSection>
+
+          {/* Campaign Overview */}
+          <BriefSection label="Campaign Overview">
+            <p className="text-sm text-gray-800 leading-relaxed">{brief.overview}</p>
+          </BriefSection>
+
+          {/* Messaging & Content */}
+          <BriefSection label="Messaging & Content" sub="What to say and how to show it">
+            <div className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1.5">Key messages</div>
+            <ul className="space-y-1 mb-3">
+              {brief.messaging.keyMessages.map((k, i) => <li key={i} className="text-sm text-gray-700">· {k}</li>)}
+            </ul>
+            <div className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1.5">CTA</div>
+            <p className="text-sm text-gray-700 mb-3">{brief.messaging.cta}</p>
+            <div className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1.5">Hashtags</div>
+            <div className="flex flex-wrap gap-1.5">
+              {brief.messaging.hashtags.map(h => <span key={h} className="text-xs bg-blue-50 text-blue-700 px-2 py-0.5 rounded font-medium">{h}</span>)}
+            </div>
+          </BriefSection>
+
+          {/* Targeting */}
+          <BriefSection label="Targeting" color="blue">
+            <div className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1">Organic targeting</div>
+            <p className="text-sm text-gray-800 mb-3">{brief.targeting.organic}</p>
+            <div className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1">Paid targeting</div>
+            <p className="text-sm text-gray-800">{brief.targeting.paid}</p>
+          </BriefSection>
+
+          {/* Influencer Criteria */}
+          <BriefSection label="Influencer Criteria" sub={brief.influencerCriteria.tier}>
+            <p className="text-sm text-gray-800 leading-relaxed mb-3">{brief.influencerCriteria.description}</p>
+            <ul className="space-y-1">
+              {brief.influencerCriteria.criteria.map((c, i) => <li key={i} className="text-xs text-gray-600">· {c}</li>)}
+            </ul>
+          </BriefSection>
+
+          {/* About brand + product */}
+          <div className="grid grid-cols-2 gap-3">
+            <BriefSection label="About the Brand">
+              <p className="text-sm text-gray-800 leading-relaxed">{brief.aboutBrand}</p>
+            </BriefSection>
+            <BriefSection label="About the Product">
+              <p className="text-sm text-gray-800 leading-relaxed">{brief.aboutProduct}</p>
+            </BriefSection>
+          </div>
+
+          {/* Do's & Don'ts */}
+          <div className="grid grid-cols-2 gap-3">
+            <BriefSection label="Do's" color="green">
+              <ul className="space-y-1.5">
+                {brief.dos.map((d, i) => <li key={i} className="text-sm text-gray-800 flex gap-2"><span className="text-green-600 flex-shrink-0">+</span><span>{d}</span></li>)}
+              </ul>
+            </BriefSection>
+            <BriefSection label="Don'ts" color="red">
+              <ul className="space-y-1.5">
+                {brief.donts.map((d, i) => <li key={i} className="text-sm text-gray-800 flex gap-2"><span className="text-red-600 flex-shrink-0">−</span><span>{d}</span></li>)}
+              </ul>
+            </BriefSection>
+          </div>
+
+          {/* Brand Tool Kit */}
+          <BriefSection label="Brand Tool Kit" sub="What to use — from assets to inspiration">
+            <div className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1.5">Tagline to use</div>
+            <p className="text-sm text-gray-900 font-semibold mb-3">"{brief.toolkit.tagline}"</p>
+            <div className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1.5">Distinctive Brand Assets</div>
+            <div className="flex flex-wrap gap-1.5 mb-3">
+              {brief.toolkit.dbas.map(d => <span key={d} className="text-xs bg-purple-50 text-purple-700 border border-purple-200 px-2 py-0.5 rounded">{d}</span>)}
+            </div>
+            <div className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1.5">Colours</div>
+            <div className="flex flex-wrap gap-1.5">
+              {brief.toolkit.colors.map(c => <span key={c} className="text-xs bg-gray-100 text-gray-700 px-2 py-0.5 rounded">{c}</span>)}
+            </div>
+            {brief.toolkit.mascot && (
+              <div className="mt-3">
+                <div className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1">Mascot</div>
+                <p className="text-sm text-gray-700">{brief.toolkit.mascot}</p>
+              </div>
+            )}
+            <div className="mt-3">
+              <div className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1.5">Brand handles to tag</div>
+              <div className="flex flex-wrap gap-2 text-sm">
+                {Object.entries(brief.toolkit.handles).filter(([k]) => k !== "note").map(([p, h]) => (
+                  <span key={p} className="font-mono text-gray-800 bg-gray-50 border border-gray-200 px-2 py-0.5 rounded">
+                    <span className="text-xs uppercase text-gray-400 mr-1">{p}</span>{h}
+                  </span>
+                ))}
+              </div>
+            </div>
+          </BriefSection>
+
+          {/* Posting Timeline */}
+          <BriefSection label="Posting Timeline">
+            <div className="space-y-1.5">
+              {brief.timeline.map((t, i) => (
+                <div key={i} className="flex items-center justify-between text-sm border-b border-gray-200 last:border-0 pb-1.5">
+                  <span className="text-gray-800">{t.stage}</span>
+                  <span className="text-gray-500 text-xs">{t.date}</span>
+                </div>
+              ))}
+            </div>
+          </BriefSection>
+
+          {/* Channels & Response Format */}
+          <div className="grid grid-cols-2 gap-3">
+            <BriefSection label="Recommended Channels">
+              <div className="flex flex-wrap gap-1.5">
+                {brief.channels.map(c => <span key={c} className="text-sm bg-blue-50 text-blue-700 border border-blue-200 px-2.5 py-1 rounded">{c}</span>)}
+              </div>
+            </BriefSection>
+            <BriefSection label="Response Format">
+              <p className="text-sm text-gray-800 leading-relaxed">{brief.responseFormat}</p>
+            </BriefSection>
+          </div>
+        </div>
+      );
+    }
+
+    // Build clean inline-styled HTML for the Word export.
+    // html-docx-js drops most class-based CSS, so we generate inline styles on tables and elements directly.
+    function renderBriefAsWordHtml(brief, brand, trend) {
+      const esc = (s) => String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+      const h = brief.header || {};
+      const m = brief.metrics || {};
+      const cm = brief.culturalMoment || {};
+      const msg = brief.messaging || {};
+      const tg = brief.targeting || {};
+      const ic = brief.influencerCriteria || {};
+      const tk = brief.toolkit || {};
+
+      const C = {
+        slate:  "#0F172A",
+        teal:   "#14B8A6",
+        tealLt: "#F0FDFA",
+        amber:  "#D97706",
+        amberLt:"#FFFBEB",
+        gray:   "#6B7280",
+        line:   "#E5E7EB",
+        text:   "#111827",
+        green:  "#16A34A",
+        red:    "#DC2626",
+        bgGray: "#F9FAFB",
+      };
+
+      const fontStack = "Calibri, Arial, sans-serif";
+
+      const sectionH2 = (title) => `<h2 style="font-family:${fontStack}; color:${C.teal}; font-size:14pt; margin:18pt 0 6pt 0; padding-bottom:3pt; border-bottom:2pt solid ${C.teal};">${esc(title)}</h2>`;
+
+      const labelValueRow = (label, value) =>
+        `<tr>
+          <td style="width:35%; padding:6pt; border:0.75pt solid ${C.line}; background-color:${C.bgGray}; font-size:9pt; color:${C.gray}; text-transform:uppercase; letter-spacing:0.05em; font-weight:bold;">${esc(label)}</td>
+          <td style="padding:6pt; border:0.75pt solid ${C.line}; font-size:11pt; color:${C.text};">${esc(value)}</td>
+        </tr>`;
+
+      const owStyle = {
+        ACT_NOW:    { bg: "#DCFCE7", text: "#15803D", label: "⚡ Act Now"          },
+        TOO_LATE:   { bg: "#FEE2E2", text: "#991B1B", label: "⏱ Probably Too Late" },
+        JOURNALIST: { bg: "#F1F5F9", text: "#334155", label: "📰 Journalist Trend" },
+        WATCH:      { bg: "#FEF3C7", text: "#92400E", label: "👁 Watch & Wait"     },
+      }[brief.opportunityWindow] || { bg: "#F3F4F6", text: "#374151", label: brief.opportunityWindow || "" };
+
+      const momentumStyle = {
+        rising:    { bg: "#DCFCE7", text: "#15803D", label: "🚀 Rising"     },
+        emerging:  { bg: "#F0FDFA", text: "#0F766E", label: "⚡ Emerging"   },
+        peaked:    { bg: "#FEF3C7", text: "#92400E", label: "🔥 Peaked"     },
+        steady:    { bg: "#F3F4F6", text: "#374151", label: "→ Steady"      },
+        declining: { bg: "#F1F5F9", text: "#475569", label: "📉 Declining"  },
+      }[m.momentum] || { bg: "#F3F4F6", text: "#374151", label: m.momentum || "—" };
+
+      // ---- HEADER BAND ----
+      let html = `
+      <div style="font-family:${fontStack}; color:${C.text};">
+        <table width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;">
+          <tr>
+            <td style="background-color:${C.slate}; padding:16pt 20pt; color:white;">
+              <div style="font-size:9pt; color:#94A3B8; text-transform:uppercase; letter-spacing:0.08em; margin-bottom:4pt;">Influencer Brief · ${esc(brand.name)}</div>
+              <div style="font-size:20pt; font-weight:bold; line-height:1.2;">${esc(trend.name)}</div>
+            </td>
+          </tr>
+        </table>
+
+        <p style="font-size:12pt; font-style:italic; padding:12pt 16pt; background-color:${C.tealLt}; border-left:4pt solid ${C.teal}; margin:0 0 14pt 0;">${esc(brief.oneLine)}</p>
+
+        <!-- Status strip: opportunity window + activation + score -->
+        <table cellpadding="0" cellspacing="0" style="border-collapse:collapse; margin:0 0 16pt 0;">
+          <tr>
+            <td style="padding:6pt 12pt; background-color:${owStyle.bg}; color:${owStyle.text}; font-weight:bold; font-size:11pt; border-radius:4pt;">${esc(owStyle.label)}</td>
+            ${brief.activationLink ? `<td style="padding-left:8pt;"><span style="padding:6pt 12pt; background-color:${C.amberLt}; color:${C.amber}; font-weight:bold; font-size:11pt;">⚡ ${esc(brief.activationLink)}</span></td>` : ""}
+            <td style="padding-left:8pt;"><span style="padding:6pt 12pt; background-color:${C.bgGray}; color:${C.text}; font-weight:bold; font-size:11pt; border:1pt solid ${C.line};">Score ${esc(brief.trendScore)}/10</span></td>
+          </tr>
+        </table>
+
+        <!-- METADATA TABLE -->
+        <table width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;">
+          ${labelValueRow("Project / Campaign", h.projectName)}
+          ${labelValueRow("Brand / Category",   h.brandCategory)}
+          ${labelValueRow("Market",             h.market)}
+          ${labelValueRow("Brand Lead",         h.brandLead)}
+          ${labelValueRow("Product",            h.product)}
+          ${labelValueRow("Briefing Date",      h.briefingDate)}
+          ${labelValueRow("Live Date",          h.liveDate)}
+          ${labelValueRow("End Date",           h.endDate)}
+        </table>
+      `;
+
+      // ---- CULTURAL MOMENT ----
+      html += sectionH2("Cultural Moment");
+      html += `<p style="font-size:11pt; margin:0 0 10pt 0;">${esc(cm.description)}</p>`;
+      const posts = cm.examplePosts || (cm.examplePost ? [cm.examplePost] : []);
+      if (posts.length) {
+        html += `<div style="font-size:9pt; color:${C.gray}; text-transform:uppercase; letter-spacing:0.05em; font-weight:bold; margin-bottom:6pt;">Example posts (${posts.length})</div>`;
+        for (const p of posts) {
+          html += `
+            <table width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse; margin-bottom:6pt;">
+              <tr>
+                <td style="padding:8pt 10pt; border:0.75pt solid ${C.line}; background-color:${C.bgGray};">
+                  <div style="font-size:9pt; color:${C.gray}; margin-bottom:3pt;"><strong>${esc(p.platform)}</strong> · ${esc(p.author)}${p.url ? ` · <a href="${esc(p.url)}" style="color:${C.teal};">View original ↗</a>` : ""}</div>
+                  <div style="font-size:11pt; font-style:italic; color:${C.text};">"${esc(p.text)}"</div>
+                </td>
+              </tr>
+            </table>`;
+        }
+      }
+
+      // ---- TREND EVIDENCE (KPI table) ----
+      html += sectionH2("Trend Evidence");
+      const subLine = m.isLiveData ? `Snapshot from Meltwater · ${esc(m.windowLabel)}` : `Mock data · ${esc(m.windowLabel)}`;
+      html += `<div style="font-size:9pt; color:${C.gray}; margin-bottom:6pt;">${subLine}</div>`;
+      html += `
+        <table width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse; margin-bottom:10pt;">
+          <tr>
+            <td width="25%" style="border:0.75pt solid ${C.line}; padding:10pt; vertical-align:top;">
+              <div style="font-size:8pt; color:${C.gray}; text-transform:uppercase; letter-spacing:0.05em; margin-bottom:3pt;">Social mentions</div>
+              <div style="font-size:18pt; font-weight:bold;">${esc(Number(m.socialTotal || 0).toLocaleString())}</div>
+              <div style="font-size:9pt; color:${C.gray};">over last 72h</div>
+            </td>
+            <td width="25%" style="border:0.75pt solid ${C.line}; padding:10pt; vertical-align:top;">
+              <div style="font-size:8pt; color:${C.gray}; text-transform:uppercase; letter-spacing:0.05em; margin-bottom:3pt;">News mentions</div>
+              <div style="font-size:18pt; font-weight:bold;">${esc(Number(m.newsTotal || 0).toLocaleString())}</div>
+              <div style="font-size:9pt; color:${C.gray};">over last 72h</div>
+            </td>
+            <td width="25%" style="border:0.75pt solid ${C.line}; padding:10pt; vertical-align:top;">
+              <div style="font-size:8pt; color:${C.gray}; text-transform:uppercase; letter-spacing:0.05em; margin-bottom:3pt;">Momentum</div>
+              <div style="padding:4pt 8pt; background-color:${momentumStyle.bg}; color:${momentumStyle.text}; font-weight:bold; font-size:10pt; display:inline-block;">${esc(momentumStyle.label)}</div>
+            </td>
+            <td width="25%" style="border:0.75pt solid ${C.line}; padding:10pt; vertical-align:top;">
+              <div style="font-size:8pt; color:${C.gray}; text-transform:uppercase; letter-spacing:0.05em; margin-bottom:3pt;">Confidence</div>
+              <div style="font-size:13pt; font-weight:bold;">${esc(m.confidence)}</div>
+            </td>
+          </tr>
+        </table>`;
+
+      if (m.hashtags && m.hashtags.length) {
+        html += `<div style="font-size:9pt; color:${C.gray}; text-transform:uppercase; letter-spacing:0.05em; font-weight:bold; margin-bottom:4pt;">Top hashtags</div>`;
+        html += `<p style="font-size:11pt; color:${C.teal}; margin:0 0 10pt 0;">${m.hashtags.map(t => esc(t)).join("&nbsp;&nbsp;")}</p>`;
+      }
+      html += `<p style="font-size:9pt; color:${C.gray}; padding-top:6pt; border-top:0.5pt solid ${C.line}; margin-top:6pt;"><strong>Data source:</strong> ${m.isLiveData ? "Meltwater social listening" : "Mock / illustrative"}${m.capturedAt ? ` · Captured ${esc(new Date(m.capturedAt).toLocaleString("en-GB", { day:"numeric", month:"short", hour:"2-digit", minute:"2-digit" }))}` : ""}</p>`;
+
+      // ---- WHY RELEVANT ----
+      html += sectionH2(`Why It's Relevant for ${brand.name}`);
+      if (brief.whyRelevant && brief.whyRelevant.length) {
+        html += `<ul style="font-size:11pt; padding-left:20pt; margin:0 0 10pt 0;">`;
+        for (const r of brief.whyRelevant) html += `<li style="margin-bottom:5pt;">${esc(r)}</li>`;
+        html += `</ul>`;
+      }
+
+      // ---- OBJECTIVE / OVERVIEW ----
+      html += sectionH2("Campaign Objective / KPIs");
+      html += `<p style="font-size:11pt; margin:0 0 6pt 0;">${esc(brief.objective)}</p>`;
+
+      html += sectionH2("Campaign Overview");
+      html += `<p style="font-size:11pt; margin:0 0 6pt 0;">${esc(brief.overview)}</p>`;
+
+      // ---- MESSAGING ----
+      html += sectionH2("Messaging & Content");
+      if (msg.keyMessages && msg.keyMessages.length) {
+        html += `<div style="font-size:9pt; color:${C.gray}; text-transform:uppercase; letter-spacing:0.05em; font-weight:bold; margin-bottom:4pt;">Key messages</div>`;
+        html += `<ul style="font-size:11pt; padding-left:20pt; margin:0 0 8pt 0;">`;
+        for (const k of msg.keyMessages) html += `<li style="margin-bottom:3pt;">${esc(k)}</li>`;
+        html += `</ul>`;
+      }
+      html += `<div style="font-size:9pt; color:${C.gray}; text-transform:uppercase; letter-spacing:0.05em; font-weight:bold; margin-bottom:4pt;">Call to action</div>`;
+      html += `<p style="font-size:11pt; margin:0 0 8pt 0;">${esc(msg.cta)}</p>`;
+      if (msg.hashtags && msg.hashtags.length) {
+        html += `<div style="font-size:9pt; color:${C.gray}; text-transform:uppercase; letter-spacing:0.05em; font-weight:bold; margin-bottom:4pt;">Hashtags</div>`;
+        html += `<p style="font-size:11pt; color:${C.teal}; margin:0 0 6pt 0;">${msg.hashtags.map(t => esc(t)).join("&nbsp;&nbsp;")}</p>`;
+      }
+
+      // ---- TARGETING ----
+      html += sectionH2("Targeting");
+      html += `
+        <table width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse; margin-bottom:8pt;">
+          <tr>
+            <td width="50%" style="border:0.75pt solid ${C.line}; padding:10pt; vertical-align:top;">
+              <div style="font-size:9pt; color:${C.gray}; text-transform:uppercase; letter-spacing:0.05em; font-weight:bold; margin-bottom:4pt;">Organic targeting</div>
+              <div style="font-size:11pt;">${esc(tg.organic)}</div>
+            </td>
+            <td width="50%" style="border:0.75pt solid ${C.line}; padding:10pt; vertical-align:top;">
+              <div style="font-size:9pt; color:${C.gray}; text-transform:uppercase; letter-spacing:0.05em; font-weight:bold; margin-bottom:4pt;">Paid targeting</div>
+              <div style="font-size:11pt;">${esc(tg.paid)}</div>
+            </td>
+          </tr>
+        </table>`;
+
+      // ---- INFLUENCER CRITERIA ----
+      html += sectionH2("Influencer Criteria");
+      if (ic.tier) html += `<div style="font-size:10pt; color:${C.gray}; font-style:italic; margin-bottom:6pt;">${esc(ic.tier)}</div>`;
+      html += `<p style="font-size:11pt; margin:0 0 6pt 0;">${esc(ic.description)}</p>`;
+      if (ic.criteria && ic.criteria.length) {
+        html += `<ul style="font-size:11pt; padding-left:20pt; margin:0 0 6pt 0;">`;
+        for (const c of ic.criteria) html += `<li style="margin-bottom:3pt;">${esc(c)}</li>`;
+        html += `</ul>`;
+      }
+
+      // ---- ABOUT BRAND / PRODUCT ----
+      html += `
+        <table width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse; margin-top:14pt;">
+          <tr>
+            <td width="50%" style="vertical-align:top; padding-right:6pt;">
+              ${sectionH2("About the Brand")}
+              <p style="font-size:11pt; margin:0;">${esc(brief.aboutBrand)}</p>
+            </td>
+            <td width="50%" style="vertical-align:top; padding-left:6pt;">
+              ${sectionH2("About the Product")}
+              <p style="font-size:11pt; margin:0;">${esc(brief.aboutProduct)}</p>
+            </td>
+          </tr>
+        </table>`;
+
+      // ---- DO'S & DON'TS ----
+      html += `
+        <table width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse; margin-top:14pt;">
+          <tr>
+            <td width="50%" style="vertical-align:top; padding:10pt; border:0.75pt solid ${C.green}; background-color:#F0FDF4;">
+              <div style="color:${C.green}; font-weight:bold; font-size:11pt; text-transform:uppercase; letter-spacing:0.05em; margin-bottom:6pt;">✓ Do's</div>
+              ${(brief.dos || []).map(d => `<div style="font-size:11pt; margin-bottom:4pt;"><strong style="color:${C.green};">+</strong> ${esc(d)}</div>`).join("")}
+            </td>
+            <td width="50%" style="vertical-align:top; padding:10pt; border:0.75pt solid ${C.red}; background-color:#FEF2F2;">
+              <div style="color:${C.red}; font-weight:bold; font-size:11pt; text-transform:uppercase; letter-spacing:0.05em; margin-bottom:6pt;">✗ Don'ts</div>
+              ${(brief.donts || []).map(d => `<div style="font-size:11pt; margin-bottom:4pt;"><strong style="color:${C.red};">−</strong> ${esc(d)}</div>`).join("")}
+            </td>
+          </tr>
+        </table>`;
+
+      // ---- BRAND TOOL KIT ----
+      html += sectionH2("Brand Tool Kit");
+      html += `<table width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;">`;
+      html += labelValueRow("Tagline to use", `"${tk.tagline || ""}"`);
+      if (tk.dbas && tk.dbas.length) html += labelValueRow("Distinctive Brand Assets", tk.dbas.join(" · "));
+      if (tk.colors && tk.colors.length) html += labelValueRow("Colours", tk.colors.join(" · "));
+      if (tk.mascot) html += labelValueRow("Mascot", tk.mascot);
+      if (tk.handles) {
+        const handles = Object.entries(tk.handles).filter(([k]) => k !== "note").map(([p, h]) => `${p}: ${h}`).join(" · ");
+        if (handles) html += labelValueRow("Brand handles to tag", handles);
+      }
+      html += `</table>`;
+
+      // ---- POSTING TIMELINE ----
+      html += sectionH2("Posting Timeline");
+      html += `<table width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;">`;
+      for (const t of brief.timeline || []) {
+        html += `<tr>
+          <td style="padding:6pt 10pt; border-bottom:0.5pt solid ${C.line}; font-size:11pt;">${esc(t.stage)}</td>
+          <td style="padding:6pt 10pt; border-bottom:0.5pt solid ${C.line}; font-size:10pt; color:${C.gray}; text-align:right;">${esc(t.date)}</td>
+        </tr>`;
+      }
+      html += `</table>`;
+
+      // ---- CHANNELS + RESPONSE FORMAT ----
+      html += `
+        <table width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse; margin-top:14pt;">
+          <tr>
+            <td width="50%" style="vertical-align:top; padding-right:6pt;">
+              ${sectionH2("Recommended Channels")}
+              <p style="font-size:11pt; margin:0;">${(brief.channels || []).map(c => esc(c)).join(" · ")}</p>
+            </td>
+            <td width="50%" style="vertical-align:top; padding-left:6pt;">
+              ${sectionH2("Response Format")}
+              <p style="font-size:11pt; margin:0;">${esc(brief.responseFormat)}</p>
+            </td>
+          </tr>
+        </table>`;
+
+      html += `</div>`;
+      return html;
+    }
+
+    function BriefModal({ trend, score, brand, liveMeta, onClose }) {
+      const brief = useMemo(() => buildBrief(trend, score, brand, liveMeta), [trend, score, brand, liveMeta]);
+      const briefRef = React.useRef(null);
+      const [downloading, setDownloading] = useState(false);
+
+      const downloadDocx = () => {
+        if (downloading) return;
+        setDownloading(true);
+        try {
+          const safe = (s) => (s || "").replace(/[^a-zA-Z0-9-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 60);
+          const dateStamp = new Date().toISOString().slice(0, 10);
+          const filename = `TrendBlender_${safe(brand.name)}_${safe(trend.name)}_${dateStamp}.docx`;
+
+          const body = renderBriefAsWordHtml(brief, brand, trend);
+          const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>${trend.name}</title></head><body>${body}</body></html>`;
+          const blob = window.htmlDocx.asBlob(html, { orientation: "portrait", margins: { top: 720, right: 720, bottom: 720, left: 720 } });
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement("a");
+          a.href = url;
+          a.download = filename;
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+          setTimeout(() => URL.revokeObjectURL(url), 1000);
+        } catch (e) {
+          console.error("Word export failed:", e);
+        } finally {
+          setDownloading(false);
+        }
+      };
+
+      return (
+        <div className="fixed inset-0 bg-black bg-opacity-50 z-50 flex items-stretch justify-end" onClick={onClose}>
+          <div className="bg-white w-full max-w-3xl overflow-y-auto shadow-2xl flex flex-col" onClick={e => e.stopPropagation()}>
+            <div className="sticky top-0 bg-white border-b border-gray-200 px-6 py-4 flex items-center justify-between z-10">
+              <div>
+                <div className="text-xs text-gray-400 mb-0.5">Influencer Brief — {brand.name}</div>
+                <h3 className="font-bold text-gray-900 text-lg leading-tight">{trend.name}</h3>
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={downloadDocx}
+                  disabled={downloading}
+                  className={`text-sm px-4 py-2 rounded-lg font-medium transition-colors ${downloading ? "bg-gray-300 text-gray-500 cursor-wait" : "bg-teal-500 hover:bg-teal-600 text-white"}`}
+                >
+                  {downloading ? "Generating…" : "↓ Download Word"}
+                </button>
+                <button onClick={onClose} className="text-gray-400 hover:text-gray-600 text-2xl leading-none">×</button>
+              </div>
+            </div>
+            <div className="p-6 flex-1" ref={briefRef}>
+              <BriefBody brief={brief} brand={brand} />
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // MORNING BRIEF MODAL
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    const BRIEF_KIND_STYLES = {
+      strongest_signal:     { icon: "🔥", accent: "border-red-300 bg-red-50",      label: "text-red-700" },
+      earned_media:         { icon: "📰", accent: "border-blue-300 bg-blue-50",    label: "text-blue-700" },
+      creator_opportunity:  { icon: "🤝", accent: "border-teal-300 bg-teal-50",    label: "text-teal-700" },
+      data_quality:         { icon: "⚠️", accent: "border-amber-300 bg-amber-50",  label: "text-amber-700" },
+      time_sensitive:       { icon: "⏰", accent: "border-purple-300 bg-purple-50", label: "text-purple-700" },
+    };
+
+    function MorningBriefModal({ brief, onClose }) {
+      const briefDate = brief?.date
+        ? new Date(brief.date).toLocaleDateString("en-GB", { weekday: "long", day: "numeric", month: "long", year: "numeric" })
+        : "Today";
+      const refreshedLabel = brief?.generated_at
+        ? new Date(brief.generated_at).toLocaleString("en-GB", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" })
+        : null;
+
+      return (
+        <div className="fixed inset-0 bg-black bg-opacity-50 z-50 flex items-stretch justify-end" onClick={onClose}>
+          <div className="bg-white w-full max-w-2xl overflow-y-auto shadow-2xl flex flex-col" onClick={e => e.stopPropagation()}>
+            <div className="sticky top-0 bg-white border-b border-gray-200 px-6 py-4 flex items-center justify-between z-10">
+              <div>
+                <div className="text-xs text-gray-400 mb-0.5 uppercase tracking-wider">Morning Brief</div>
+                <h3 className="font-bold text-gray-900 text-lg leading-tight">{briefDate}</h3>
+                {refreshedLabel && (
+                  <div className="text-xs text-gray-500 mt-1">Generated {refreshedLabel} · covers {(brief.generated_for || []).join(" · ")}</div>
+                )}
+              </div>
+              <button onClick={onClose} className="text-gray-400 hover:text-gray-600 text-2xl leading-none">×</button>
+            </div>
+            <div className="p-6 flex-1 space-y-4">
+              {!brief && (
+                <div className="text-sm text-gray-500 italic">No morning brief available yet. The daily refresh writes one at ~22:00 UK time.</div>
+              )}
+              {brief?.bullets?.map((b, i) => {
+                const s = BRIEF_KIND_STYLES[b.kind] || { icon: "•", accent: "border-gray-200 bg-gray-50", label: "text-gray-700" };
+                return (
+                  <div key={i} className={`rounded-xl border ${s.accent} p-5`}>
+                    <div className="flex items-start gap-3">
+                      <div className="text-xl flex-shrink-0 leading-none mt-0.5">{s.icon}</div>
+                      <div className="min-w-0 flex-1">
+                        <div className={`text-xs font-semibold uppercase tracking-wider ${s.label}`}>{b.label}</div>
+                        <h4 className="font-semibold text-gray-900 mt-1 leading-snug">{b.title}</h4>
+                        <p className="text-sm text-gray-700 mt-2 leading-relaxed">{b.body}</p>
+                        {b.brand_relevance?.length > 0 && (
+                          <div className="flex flex-wrap gap-1.5 mt-3">
+                            {b.brand_relevance.map(bk => {
+                              const cfg = getBrandConfig();
+                              const label = (cfg && cfg.brand && cfg.brand.id === bk) ? cfg.brand.name : bk;
+                              return (
+                                <span key={bk} className="text-[10px] font-medium bg-white border border-gray-200 text-gray-600 px-2 py-0.5 rounded uppercase tracking-wide">
+                                  {label}
+                                </span>
+                              );
+                            })}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
+              <div className="text-xs text-gray-400 text-center pt-2 pb-2 italic">
+                Refreshes daily at 22:00 UK. To regenerate now, ask Claude to run the trends refresh.
+              </div>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // APP
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    function App() {
+      // Single-brand-per-install: brandKey and brand identity come entirely from
+      // window.BRAND_CONFIG (or the placeholder fallback if it hasn't loaded).
+      // There is no brand switcher any more — flatten brand.* alongside the rest
+      // of the config so the rest of the app can keep reading brand.name,
+      // brand.category etc. directly.
+      const cfg = getBrandConfig();
+      const brand = {
+        ...cfg.brand,
+        identity: cfg.identity,
+        audienceSegments: cfg.audienceSegments,
+        activations: cfg.activations,
+        territory: cfg.territory,
+        rejectList: cfg.rejectList,
+        pillars: cfg.pillars,
+        scoring: cfg.scoring,
+        ops: cfg.ops,
+        meta: cfg.meta,
+      };
+      const brandKey = brand.id;
+
+      const [section, setSection]         = useState("trends");
+      const [briefModal, setBriefModal]   = useState(null);
+      const [showMorningBrief, setShowMorningBrief] = useState(false);
+      const morningBrief = (typeof window !== "undefined" && window.MORNING_BRIEF) || null;
+
+      const live = liveTrendsFor(brandKey);
+      const trends = live ? live.trends : MOCK_TRENDS;
+      const liveMeta = live ? { generated_at: live.generated_at, source_searches: live.source_searches, data_quality_notes: live.data_quality_notes } : null;
+      const actNowCount = trends.filter(t => opportunityWindow(t.social, t.news) === "ACT_NOW").length;
+
+      const nav = [
+        { id: "brand",  icon: "🧬", label: "Brand DNA" },
+        { id: "trends", icon: "📈", label: "Trends",   badge: actNowCount },
+      ];
+
+      return (
+        <div className="flex h-screen bg-gray-50 font-sans overflow-hidden">
+          {/* Sidebar */}
+          <div className="w-56 bg-slate-900 flex flex-col flex-shrink-0 shadow-xl">
+            <div className="px-5 py-5 border-b border-slate-700">
+              <div className="text-white font-bold text-lg">{(brand.identity && brand.identity.logoText) || "TrendBlender"}</div>
+              <div className="text-slate-400 text-xs mt-0.5">Meltwater trend intelligence</div>
+            </div>
+
+            {/* Single-brand identity display — no brand switcher. Each plugin build
+                is scoped to exactly one brand via brand_config.js (window.BRAND_CONFIG). */}
+            <div className="px-4 py-3 border-b border-slate-700">
+              <div className="w-full bg-slate-800 rounded-lg px-3 py-2.5">
+                <div className="text-white text-sm font-semibold">{brand.name}</div>
+                <div className="text-slate-400 text-xs">{brand.category}</div>
+              </div>
+            </div>
+
+            <nav className="flex-1 px-3 py-4 space-y-1">
+              {nav.map(item => (
+                <button key={item.id} onClick={() => setSection(item.id)} className={`w-full flex items-center justify-between px-3 py-2.5 rounded-lg text-sm transition-colors ${section === item.id ? "bg-teal-500 text-white font-semibold" : "text-slate-300 hover:bg-slate-800 hover:text-white"}`}>
+                  <span className="flex items-center gap-2.5">
+                    <span>{item.icon}</span>
+                    <span>{item.label}</span>
+                  </span>
+                  {item.badge ? (
+                    <span className={`text-xs font-bold px-1.5 py-0.5 rounded-full ${section === item.id ? "bg-white text-teal-600" : "bg-teal-500 text-white"}`}>{item.badge}</span>
+                  ) : null}
+                </button>
+              ))}
+            </nav>
+
+            <div className="px-4 py-4 border-t border-slate-700">
+              <div className="text-slate-600 text-xs">Last updated: Today</div>
+            </div>
+          </div>
+
+          {/* Main */}
+          <div className="flex-1 overflow-y-auto">
+            {/* Top bar — Morning Brief access */}
+            <div className="sticky top-0 z-30 bg-white/95 backdrop-blur border-b border-gray-200 px-6 py-2.5 flex items-center justify-end gap-3">
+              {morningBrief?.date && (
+                <span className="text-xs text-gray-500">
+                  Brief generated {new Date(morningBrief.generated_at).toLocaleString("en-GB", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" })}
+                </span>
+              )}
+              <button
+                onClick={() => setShowMorningBrief(true)}
+                disabled={!morningBrief}
+                className={`text-sm px-4 py-2 rounded-lg font-medium transition-colors flex items-center gap-2 ${morningBrief ? "bg-slate-900 hover:bg-slate-800 text-white" : "bg-gray-200 text-gray-400 cursor-not-allowed"}`}
+                title={morningBrief ? "Open today's morning brief" : "No morning brief available yet"}
+              >
+                <span>📋</span>
+                <span>Morning Brief</span>
+              </button>
+            </div>
+            {section === "brand"  && <BrandDNA brand={brand} />}
+            {section === "trends" && <Trends brand={brand} trends={trends} liveMeta={liveMeta} onBrief={(trend, score) => setBriefModal({ trend, score })} />}
+          </div>
+
+          {briefModal && <BriefModal trend={briefModal.trend} score={briefModal.score} brand={brand} liveMeta={liveMeta} onClose={() => setBriefModal(null)} />}
+          {showMorningBrief && <MorningBriefModal brief={morningBrief} onClose={() => setShowMorningBrief(false)} />}
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+  </script>
+</body>
+</html>

@@ -1,0 +1,36 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/willdaniel-MW/trendblender-skeleton/schema/morning-brief.schema.json",
+  "title": "TrendBlender Morning Brief",
+  "description": "window.MORNING_BRIEF shape. Exactly four bullets, fixed order, fixed kind values — brand-agnostic, this is the one client-facing artifact's contract.",
+  "type": "object",
+  "required": ["generated_at", "date", "generated_for", "bullets"],
+  "additionalProperties": false,
+  "properties": {
+    "generated_at": { "type": "string" },
+    "date": { "type": "string", "format": "date" },
+    "generated_for": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "string" },
+      "description": "brandKey(s) this brief covers. Usually a single brand for a brand-specific plugin build."
+    },
+    "bullets": {
+      "type": "array",
+      "minItems": 4,
+      "maxItems": 4,
+      "items": {
+        "type": "object",
+        "required": ["kind", "label", "title", "body"],
+        "additionalProperties": false,
+        "properties": {
+          "kind": { "type": "string", "enum": ["strongest_signal", "earned_media", "creator_opportunity", "time_sensitive"] },
+          "label": { "type": "string" },
+          "title": { "type": "string" },
+          "body": { "type": "string" },
+          "brand_relevance": { "type": "array", "items": { "type": "string" } }
+        }
+      }
+    }
+  }
+}
